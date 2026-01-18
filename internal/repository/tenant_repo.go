@@ -48,6 +48,11 @@ func (r *PostgresTenantRepo) Create(ctx context.Context, tenant *models.Tenant) 
 }
 
 func (r *PostgresTenantRepo) GetByID(ctx context.Context, id string) (*models.Tenant, error) {
+
+	if id == "" {
+		return nil, ErrTenantNotFound
+	}
+
 	var t models.Tenant
 
 	query := `

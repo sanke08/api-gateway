@@ -9,5 +9,4 @@ var (
 	ErrUserExists     = errors.New("user already exists")
 	ErrAPIKeyNotFound = errors.New("api key not found")
 	ErrNoRowsAffected = errors.New("no rows affected")
-	ErrDataIntegrity  = errors.New("data integrity violation")
 )
