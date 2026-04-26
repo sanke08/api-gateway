@@ -2,17 +2,23 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 CREATE TABLE IF NOT EXISTS usage (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id UUID NOT NULL,
-    api_key_id UUID NOT NULL,
-    path TEXT NOT NULL,
-    method VARCHAR(10) NOT NULL,
-    
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    api_key_id UUID NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+    endpoint TEXT NOT NULL,
+    method TEXT NOT NULL,
+
+    bytes_in BIGINT NOT NULL DEFAULT 0,
+    bytes_out BIGINT NOT NULL DEFAULT 0,
+
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  
-    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
-    FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+
+
+CREATE INDEX IF NOT EXISTS idx_usage_tenant_api_time ON "usage"(tenant_id, api_key_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_tenant_time ON "usage"(tenant_id, created_at DESC);
+
 
 -- trigger to auto update updated_at
 DO $$

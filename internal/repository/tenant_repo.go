@@ -7,18 +7,9 @@ import (
 	"github.com/sanke08/api_gateway/internal/models"
 )
 
-// TenantRepository defines DB operations for Tenant entity.
-// Services only depend on this interface, making DB swappable.
-type TenantRepository interface {
-	Create(ctx context.Context, tenant *models.Tenant) error
-	GetByID(ctx context.Context, id string) (*models.Tenant, error)
-	GetByDomain(ctx context.Context, domain string) (*models.Tenant, error)
-	Update(ctx context.Context, tenant *models.Tenant) error
-}
-
 // PostgresTenantRepo implements TenantRepository using Postgres
 type PostgresTenantRepo struct {
-	db *sql.DB
+	db sqlExecutor
 }
 
 // NewPostgresTenantRepo creates a new PostgresTenantRepo instance
@@ -26,37 +17,65 @@ func NewPostgresTenantRepo(db *sql.DB) TenantRepository {
 	return &PostgresTenantRepo{db: db}
 }
 
-func (r *PostgresTenantRepo) Create(ctx context.Context, tenant *models.Tenant) error {
-	query := `
-		INSERT INTO tenants (domain, name, status) 
-		VALUES ($1, $2, $3)
-		ON CONFLICT (domain) DO NOTHING
-		RETURNING id, created_at, updated_at
-	`
-	err := r.db.QueryRowContext(
-		ctx, query,
-		tenant.Domain, tenant.Name, tenant.Status,
-	).Scan(&tenant.ID, &tenant.CreatedAt, &tenant.UpdatedAt)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return ErrTenantExists
-		}
-		return err
-	}
-	return nil
+// WithTx rebinds the repository to a transaction.
+func (r *PostgresTenantRepo) WithTx(tx *sql.Tx) TenantRepository {
+	return &PostgresTenantRepo{db: tx}
 }
 
-func (r *PostgresTenantRepo) GetByID(ctx context.Context, id string) (*models.Tenant, error) {
+func (r *PostgresTenantRepo) Create(ctx context.Context, tenant models.Tenant) (models.Tenant, error) {
+	const op = "tenant.create"
 
+	normalized, err := normalizeTenantForCreate(tenant)
+	if err != nil {
+		return models.Tenant{}, err
+	}
+
+	const q = `
+		INSERT INTO tenants (id, name, slug, status, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, name, slug, status, created_at, updated_at
+	`
+
+	var out models.Tenant
+	var status string
+
+	err = r.db.QueryRowContext(ctx, q,
+		normalized.Id,
+		normalized.Name,
+		normalized.Slug,
+		string(normalized.Status),
+		normalized.CreatedAt,
+		normalized.UpdatedAt,
+	).Scan(
+		&out.Id,
+		&out.Name,
+		&out.Slug,
+		&status,
+		&out.CreatedAt,
+		&out.UpdatedAt,
+	)
+	if err != nil {
+		return models.Tenant{}, classifySQLError(op, "tenant", err, true)
+	}
+
+	out.Status = models.TenantStatus(status)
+	return out, nil
+}
+
+func (r *PostgresTenantRepo) GetByID(ctx context.Context, id string) (models.Tenant, error) {
+
+	const op = "tenant.get_by_id"
+
+	id = trimString(id)
 	if id == "" {
-		return nil, ErrTenantNotFound
+		return models.Tenant{}, validationError(op, "tenant", "id is required")
 	}
 
 	var t models.Tenant
+	var status string
 
 	query := `
-		SELECT id, domain, name, status, created_at, updated_at
+		SELECT id, Slug, name, status, created_at, updated_at
 		FROM tenants
 		WHERE id = $1
 	`
@@ -64,65 +83,68 @@ func (r *PostgresTenantRepo) GetByID(ctx context.Context, id string) (*models.Te
 	err := r.db.QueryRowContext(
 		ctx, query,
 		id,
-	).Scan(&t.ID, &t.Domain, &t.Name, &t.Status, &t.CreatedAt, &t.UpdatedAt)
+	).Scan(&t.Id, &t.Slug, &t.Name, &status, &t.CreatedAt, &t.UpdatedAt)
 
-	if err == sql.ErrNoRows {
-		return nil, ErrTenantNotFound
-	}
 	if err != nil {
-		return nil, err
+		return models.Tenant{}, classifySQLError(op, "tenant", err, true)
 	}
-	return &t, nil
 
+	t.Status = models.TenantStatus(status)
+
+	return t, nil
 }
 
-func (r *PostgresTenantRepo) GetByDomain(ctx context.Context, domain string) (*models.Tenant, error) {
+func (r *PostgresTenantRepo) GetBySlug(ctx context.Context, Slug string) (models.Tenant, error) {
+	const op = "tenant.get_by_Slug"
+
+	Slug = trimString(Slug)
+	if Slug == "" {
+		return models.Tenant{}, validationError(op, "tenant", "Slug is required")
+	}
+
 	var t models.Tenant
+	var status string
 
 	query := `
-		SELECT id, domain, name, status, created_at, updated_at
+		SELECT id, Slug, name, status, created_at, updated_at
 		FROM tenants
-		WHERE domain = $1
+		WHERE Slug = $1
 	`
 
 	err := r.db.QueryRowContext(
 		ctx, query,
-		domain,
-	).Scan(&t.ID, &t.Domain, &t.Name, &t.Status, &t.CreatedAt, &t.UpdatedAt)
-
-	if err == sql.ErrNoRows {
-		return nil, ErrTenantNotFound
-	}
+		Slug,
+	).Scan(&t.Id, &t.Slug, &t.Name, &status, &t.CreatedAt, &t.UpdatedAt)
 
 	if err != nil {
-		return nil, err
+		return models.Tenant{}, classifySQLError(op, "tenant", err, true)
 	}
 
-	return &t, nil
+	return t, nil
 }
 
-func (r *PostgresTenantRepo) Update(ctx context.Context, tenant *models.Tenant) error {
+// func (r *PostgresTenantRepo) Update(ctx context.Context, tenant *models.Tenant) error {
 
-	query := `
-		UPDATE tenants
-		SET domain = $2, name = $3, status = $4
-		WHERE id = $1
-	`
+// 	query := `
+// 		UPDATE tenants
+// 		SET Slug = $2, name = $3, status = $4
+// 		WHERE id = $1
+// 	`
 
-	res, err := r.db.ExecContext(
-		ctx, query,
-		tenant.ID, tenant.Domain, tenant.Name, tenant.Status,
-	)
+// 	res, err := r.db.ExecContext(
+// 		ctx, query,
+// 		tenant.ID, tenant.Slug, tenant.Name, tenant.Status,
+// 	)
 
-	if err != nil {
-		return err
-	}
+// 	if err != nil {
+// 		return err
+// 	}
 
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return ErrTenantNotFound
-	}
+// 	rows, _ := res.RowsAffected()
+// 	if rows == 0 {
+// 		return ErrTenantNotFound
+// 	}
 
-	return nil
+// 	return nil
 
-}
+// }

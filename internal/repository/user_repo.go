@@ -7,45 +7,65 @@ import (
 	"github.com/sanke08/api_gateway/internal/models"
 )
 
-type UserRepository interface {
-	Create(ctx context.Context, user *models.User) error
-	GetByEmail(ctx context.Context, email string) (*models.User, error)
-}
-
 type PostgresUserRepo struct {
-	db *sql.DB
+	db sqlExecutor
 }
 
 func NewPostgresUserRepo(db *sql.DB) UserRepository {
 	return &PostgresUserRepo{db: db}
 }
 
-func (r *PostgresUserRepo) Create(ctx context.Context, user *models.User) error {
+// WithTx rebinds the repository to a transaction.
+func (r *PostgresUserRepo) WithTx(tx *sql.Tx) UserRepository {
+	return &PostgresUserRepo{db: tx}
+}
+
+func (r *PostgresUserRepo) Create(ctx context.Context, user models.User) (models.User, error) {
+	const op = "user.create"
+
+	normalized, err := normalizeUserForCreate(user)
+	if err != nil {
+		return models.User{}, err
+	}
+
+	var out models.User
+
 	query := `
-		INSERT INTO users (id, email, password, tenant_id)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO users (email, password_hash)
+		VALUES ($1, $2)
 		RETURNING id
 	`
 
-	err := r.db.QueryRowContext(
+	err = r.db.QueryRowContext(
 		ctx, query,
-		user.ID, user.Email, user.Password, user.TenantID,
-	).Scan(&user.ID)
+		normalized.Email, normalized.PasswordHash,
+	).Scan(
+		&out.Id,
+		&out.Email,
+		&out.PasswordHash,
+		&out.CreatedAt,
+		&out.UpdatedAt,
+	)
 
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return ErrUserExists
-		}
-		return err
+		return models.User{}, classifySQLError(op, "user", err, true)
 	}
 
-	return nil
+	return out, nil
 }
 
-func (r *PostgresUserRepo) GetByEmail(ctx context.Context, email string) (*models.User, error) {
+func (r *PostgresUserRepo) GetByEmail(ctx context.Context, email string) (models.User, error) {
+
+	const op = "user.get_by_email"
+
+	email = trimString(email)
+	if email == "" {
+		return models.User{}, validationError(op, "user", "email is required")
+	}
+
 	var u models.User
 	query := `
-		SELECT id, email, password, role tenant_id
+		SELECT id, email, password_hash
 		FROM users
 		WHERE email = $1
 	`
@@ -53,13 +73,36 @@ func (r *PostgresUserRepo) GetByEmail(ctx context.Context, email string) (*model
 	err := r.db.QueryRowContext(
 		ctx, query,
 		email,
-	).Scan(&u.ID, &u.Email, &u.Password, &u.Role, &u.TenantID)
+	).Scan(&u.Id, &u.Email, &u.PasswordHash)
 
-	if err == sql.ErrNoRows {
-		return nil, ErrUserNotFound
-	}
 	if err != nil {
-		return nil, err
+		return models.User{}, classifySQLError(op, "user", err, true)
 	}
-	return &u, nil
+
+	return u, nil
+}
+
+func (r *PostgresUserRepo) GetById(ctx context.Context, id string) (models.User, error) {
+
+	const op = "user.get_by_id"
+
+	id = trimString(id)
+	if id == "" {
+		return models.User{}, validationError(op, "user", "id is required")
+	}
+
+	query := `
+		SELECT id, email, password_hash
+		FROM users
+		WHERE id = $1	
+	`
+	var u models.User
+
+	err := r.db.QueryRowContext(ctx, query, id).
+		Scan(&u.Id, &u.Email, &u.PasswordHash)
+
+	if err != nil {
+		return models.User{}, classifySQLError(op, "user", err, true)
+	}
+	return u, nil
 }

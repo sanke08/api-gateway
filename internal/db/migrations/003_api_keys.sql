@@ -1,20 +1,22 @@
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
-CREATE TABLE IF NOT EXISTS api_keys (
+-- The api_keys table stores machine credentials scoped to a tenant.
+-- API keys must remain tenant-specific because machines act on behalf of a business,
+-- not on behalf of a global user identity.
+
+CREATE TABLE api_keys (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    
-    tenant_id UUID NOT NULL,
-    key VARCHAR(255) NOT NULL UNIQUE,
-    
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    key_hash TEXT NOT NULL UNIQUE,
+    description TEXT,
     active BOOLEAN NOT NULL DEFAULT TRUE,
 
-    expires_at TIMESTAMP,
-
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  
-    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+    created_at TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP  DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX idx_api_keys_tenant_id ON api_keys(tenant_id);
+CREATE UNIQUE INDEX idx_api_keys_key_hash ON api_keys(key_hash);
 
 -- trigger to auto update updated_at
 DO $$
