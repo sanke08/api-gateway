@@ -16,7 +16,11 @@ Repositories are "dumb" and focus on SQL execution. They support:
 - **Onboarding Service**: Orchestrates the complex creation of a new business entity (Tenant + Admin User + Owner Membership + API Key) in one atomic transaction.
 - **Security Services**: Custom implementations of PBKDF2-HMAC-SHA256 for passwords and SHA-256 for API keys using only `crypto/*` packages.
 
-### 3. Error Pipeline
+### 3. Authentication & Tenant Resolution
+- **Custom JWT Implementation**: Full JWT generation, signing (HMAC-SHA256), and verification using only the standard `crypto` package.
+- **Tenant Resolution Middleware**: Validates access tokens and resolves tenant membership dynamically per request.
+
+### 4. Error Pipeline
 We use a three-tier error system to ensure implementation details never leak to the client:
 - `RepoError`: Categorizes DB failures (not_found, conflict).
 - `ServiceError`: Categorizes business failures (validation, internal).
@@ -29,9 +33,10 @@ We use a three-tier error system to ensure implementation details never leak to 
 - [x] **Multi-Tenant Schema**: Users can belong to many Tenants via `TenantMembership`.
 - [x] **Usage Metering**: Log-based tracking of traffic volume (Bytes In/Out).
 - [x] **Structured Logging**: JSON logging via `slog` with Request ID tracing.
+- [x] **Authentication & JWT**: Custom standard-library-only JWT implementation and login flow.
+- [x] **Tenant Resolution Middleware**: Validates user access tokens against requested tenants.
 
 ## 🛠️ Remaining Tasks (Roadmap)
-- [ ] **Auth Middleware**: Implement JWT/Session verification for user endpoints.
 - [ ] **Gateway Proxy**: Implement the reverse-proxy logic to route traffic to backends.
 - [ ] **Key Validation Middleware**: The "Hot Path" to validate hashed API keys on every request.
 - [ ] **Admin Dashboard API**: Endpoints for tenant management and usage analytics.
