@@ -23,6 +23,9 @@ const (
 	// resolvedMembershipContextKey stores the membership that authorizes the user
 	// inside the selected tenant.
 	resolvedMembershipContextKey contextKey = "resolved_membership"
+
+	// resolvedAPIKeyContextKey stores the API key that authenticated the machine
+	resolvedAPIKeyContextKey contextKey = "resolved_api_key"
 )
 
 // WithAuthenticatedUser stores the authenticated user in the request context.
@@ -75,4 +78,24 @@ func ResolvedMembershipFromContext(ctx context.Context) (models.TenantMembership
 
 	membership, ok := value.(models.TenantMembership)
 	return membership, ok
+}
+
+// WithResolvedAPIKey stores the resolved API key in the context.
+//
+// Why this exists:
+// Machine-authenticated routes often need to know exactly which API key was used
+// for authorization, auditing, rate limiting, or usage tracking.
+func WithResolvedAPIKey(ctx context.Context, apiKey models.APIKey) context.Context {
+	return context.WithValue(ctx, resolvedAPIKeyContextKey, apiKey)
+}
+
+// ResolvedAPIKeyFromContext reads the resolved API key from the context.
+func ResolvedAPIKeyFromContext(ctx context.Context) (models.APIKey, bool) {
+	value := ctx.Value(resolvedAPIKeyContextKey)
+	if value == nil {
+		return models.APIKey{}, false
+	}
+
+	apiKey, ok := value.(models.APIKey)
+	return apiKey, ok
 }
