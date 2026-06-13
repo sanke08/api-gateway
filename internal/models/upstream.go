@@ -236,6 +236,9 @@ type UpstreamTarget struct {
 	// - Resources would be exhausted.
 	Timeout time.Duration
 
+	// Retry controls how the gateway retries temporary upstream failures.
+	Retry RetryPolicy
+
 	// RequestTransform describes request-side modifications.
 	RequestTransform RequestTransform
 

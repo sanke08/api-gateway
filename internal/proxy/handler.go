@@ -15,6 +15,7 @@ import (
 
 	"github.com/sanke08/api_gateway/internal/models"
 	requesttypes "github.com/sanke08/api_gateway/internal/pkg/types"
+	"github.com/sanke08/api_gateway/internal/retry"
 )
 
 // Handler is the final gateway component before traffic
@@ -407,7 +408,11 @@ func buildProxy(target models.UpstreamTarget, logger *slog.Logger) (*httputil.Re
 		FlushInterval: 100 * time.Millisecond,
 	}
 
-	proxy.Transport = transportForTarget(target)
+	transport, err := transportForTarget(target)
+	if err != nil {
+		return nil, err
+	}
+	proxy.Transport = transport
 
 	return proxy, nil
 }
@@ -594,10 +599,10 @@ func handleProxyError(
 // Why this exists:
 // Different upstreams may eventually need different timeout behavior.
 // The transport is the part that actually performs the HTTP request.
-func transportForTarget(target models.UpstreamTarget) http.RoundTripper {
+func transportForTarget(target models.UpstreamTarget) (http.RoundTripper, error) {
 	base, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
-		return http.DefaultTransport
+		return nil, errors.New("default transport is not an http transport")
 	}
 
 	clone := base.Clone()
@@ -607,7 +612,17 @@ func transportForTarget(target models.UpstreamTarget) http.RoundTripper {
 		clone.ExpectContinueTimeout = target.Timeout
 	}
 
-	return clone
+	retryTransport, err := retry.NewTransport(clone, retry.Policy{
+		Attempts: target.Retry.Attempts,
+		Delay:    target.Retry.Delay,
+		MaxDelay: target.Retry.MaxDelay,
+		Jitter:   target.Retry.Jitter,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return retryTransport, nil
 }
 
 // writeProxyError writes a JSON error response from the proxy layer.
