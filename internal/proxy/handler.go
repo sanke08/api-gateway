@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	circuitbreaker "github.com/sanke08/api_gateway/internal/circuit_breaker"
 	"github.com/sanke08/api_gateway/internal/models"
 	requesttypes "github.com/sanke08/api_gateway/internal/pkg/types"
 	"github.com/sanke08/api_gateway/internal/retry"
@@ -575,7 +577,15 @@ func handleProxyError(
 	code := "bad_gateway"
 	message := "upstream request failed"
 
-	if isTimeoutError(err) {
+	if retryAfter, ok := circuitbreaker.RetryAfterDuration(err); ok {
+		status = http.StatusServiceUnavailable
+		code = "circuit_open"
+		message = "upstream is temporarily unavailable"
+
+		if retryAfter > 0 {
+			rw.Header().Set("Retry-After", fmt.Sprintf("%d", int64(retryAfter/time.Second)))
+		}
+	} else if isTimeoutError(err) {
 		status = http.StatusGatewayTimeout
 		code = "gateway_timeout"
 		message = "upstream request timed out"
@@ -599,6 +609,11 @@ func handleProxyError(
 // Why this exists:
 // Different upstreams may eventually need different timeout behavior.
 // The transport is the part that actually performs the HTTP request.
+//
+// Why retries are wrapped first:
+// Retry logic is the first recovery layer.
+// Why circuit breaker is wrapped around it:
+// The breaker should observe the final upstream outcome after retries are exhausted.
 func transportForTarget(target models.UpstreamTarget) (http.RoundTripper, error) {
 	base, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
@@ -622,7 +637,21 @@ func transportForTarget(target models.UpstreamTarget) (http.RoundTripper, error)
 		return nil, err
 	}
 
-	return retryTransport, nil
+	breaker, err := circuitbreaker.New(target.Breaker)
+	if err != nil {
+		return nil, err
+	}
+
+	breakerTransport, err := circuitbreaker.NewTransport(
+		retryTransport,
+		breaker,
+		target.Name,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return breakerTransport, nil
 }
 
 // writeProxyError writes a JSON error response from the proxy layer.

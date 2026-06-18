@@ -245,6 +245,9 @@ type UpstreamTarget struct {
 	// ResponseTransform describes response-side modifications.
 	ResponseTransform ResponseTransform
 
+	// Breaker controls circuit breaker behavior.
+	Breaker CircuitBreakerPolicy
+
 	// CreatedAt records when this upstream was created.
 	//
 	// Example:
