@@ -20,7 +20,7 @@ as you complete them. Full context for each item is in
 | 🟢 P2 — Build-out / roadmap              |  0   |   9   |
 | **TOTAL**                               |  **0** | **24** |
 
-_Last updated: 2026-06-21_
+_Last updated: 2026-06-21 (added response cache middleware)_
 
 ---
 
@@ -130,28 +130,36 @@ _Last updated: 2026-06-21_
   goroutine for the rate limiter, and a real migration runner.
 - [ ] **R8 — Admin / dashboard API.** Tenant management + usage analytics
   endpoints (not started).
-- [ ] **R9 — Wire the cache layer.** The cache packages (`cacheclient`,
-  `cache.MemoryStore`, `cache.HybridStore`) are fully built but never
-  instantiated. Four steps are required:
-  1. **Config** — add `CacheConfig` to `internal/config/config.go` with env
-     vars `CACHE_REMOTE_URL` (blank = local-only), `CACHE_TIMEOUT` (default 2s),
-     `CACHE_NAMESPACE` (default `"gateway"`), `CACHE_TOKEN` (optional Bearer
-     token for the remote cache service).
-  2. **Bootstrap** — in `main.go` / `server.New`: construct a `RemoteClient`
-     when `CACHE_REMOTE_URL` is non-blank, wrap it with `NewHybridStore`, and
-     pass the store to middleware constructors.
-  3. **Middleware injection** — `APIKeyAuthMiddleware` and
-     `TenantResolutionMiddleware` should accept a `*cache.HybridStore` (or
-     `cache.Store`) and use `Get` before hitting the DB; call `Set` on a miss.
-     Suggested key scheme: `apikey:<sha256-hex>`, `tenant:<tenant-id>`,
-     `membership:<user-id>:<tenant-id>`. Suggested TTL: 5 min (tune via config).
-  4. **Pruning goroutine** — start a background `time.Ticker` (every 5 min) that
-     calls `MemoryStore.PruneExpired()` to reclaim stale in-process entries.
+- [ ] **R9 — Wire the cache layer.** All cache packages are fully built and
+  compile cleanly but nothing instantiates them. Five steps are required:
+  1. **Config** — add `CacheConfig` struct to `internal/config/config.go` with
+     env vars `CACHE_REMOTE_URL` (blank = local-only), `CACHE_TIMEOUT` (default
+     2s), `CACHE_NAMESPACE` (default `"gateway"`), `CACHE_TOKEN` (optional
+     Bearer token for the remote cache service).
+  2. **Bootstrap** — in `main.go` / `server.New`: if `CACHE_REMOTE_URL` is
+     non-blank, call `cacheclient.NewRemoteClient(...)` and wrap with
+     `cache.NewHybridStore(remote, nil)`. Otherwise use
+     `cache.NewHybridStore(nil, nil)` (local-only). Pass the store to all
+     middleware constructors.
+  3. **Identity cache injection** — `APIKeyAuthMiddleware` and
+     `TenantResolutionMiddleware` should accept `cache.Store` and use `Get`
+     before hitting the DB; call `Set` on a miss. Key scheme:
+     `apikey:<sha256-hex>` · `tenant:<tenant-id>` ·
+     `membership:<user-id>:<tenant-id>`. TTL: 5 min (tune via config).
+  4. **Response cache injection** — for each proxied route that should cache,
+     wrap the proxy handler with `NewResponseCacheMiddleware(store, policy)`.
+     Configure `ResponseCachePolicy` per route (TTL, MaxBodyBytes, VaryHeaders,
+     CacheableStatuses, KeyPrefix). Only GET + 200 OK + no no-store + no
+     Set-Cookie responses are stored.
+  5. **Pruning goroutine** — start a background `time.Ticker` (every 5 min)
+     that calls `memoryStore.PruneExpired()` to reclaim stale in-process
+     entries.
   - Files: [internal/config/config.go](internal/config/config.go),
     [internal/cmd/gateway/main.go](internal/cmd/gateway/main.go),
     [internal/server/server.go](internal/server/server.go),
     [internal/middleware/api_key_auth_middleware.go](internal/middleware/api_key_auth_middleware.go),
-    [internal/middleware/tenant_resolution_middleware.go](internal/middleware/tenant_resolution_middleware.go)
+    [internal/middleware/tenant_resolution_middleware.go](internal/middleware/tenant_resolution_middleware.go),
+    [internal/middleware/response_cache_middleware.go](internal/middleware/response_cache_middleware.go)
   - ⛓️ Depends on: B1 (app must be assembled first).
 
 ---
@@ -182,6 +190,8 @@ Components that are **built and individually coherent** today (compile clean,
 | Remote cache client (`cacheclient.RemoteClient`) | ⚠️ Built | HTTP + base64; no env config, not injected into middleware (R9) |
 | In-process cache (`cache.MemoryStore`) | ⚠️ Built | RWMutex, TTL, clock injection, PruneExpired; not injected (R9) |
 | Hybrid cache (`cache.HybridStore`) | ⚠️ Built | Remote-first + local fallback; not wired into auth path (R9) |
+| `CachedResponse` + key builders (`cache/response.go`) | ⚠️ Built | Serialisation, replay, eligibility guards; consumed by response cache middleware (R9) |
+| Response cache middleware (`middleware/response_cache_middleware.go`) | ⚠️ Built | captureWriter tee, per-policy normalisation, tenant-isolated keys; not registered on any route (R9) |
 | Rate limiter (token bucket) | ⚠️ Built | In-memory; not routed (R1) |
 
 > ✅ Done = complete as intended · ⚠️ Built = code exists & compiles but is not
@@ -194,7 +204,8 @@ Components that are **built and individually coherent** today (compile clean,
 - Usage writing from the request path → **R4**
 - Admin / dashboard API → **R8**
 - Tests → **C6**
-- Cache config env vars + middleware injection → **R9** (packages built; wiring not started)
+- Cache config env vars + identity middleware injection → **R9** (packages built; wiring not started)
+- Response cache middleware registration on proxied routes → **R9**
 
 ---
 

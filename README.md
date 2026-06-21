@@ -92,13 +92,16 @@ STYLE: Hand-drawn whiteboard diagram in the Excalidraw / Eraser.io aesthetic.
    - [Repository Layer](#6-repository-layer)
    - [Service Layer](#7-service-layer)
    - [HTTP Handlers](#8-http-handlers)
-   - [Middleware](#9-middleware)
+   - [Middleware](#9-middleware) (Logging · APIKeyAuth · TenantResolution · ResponseCache)
    - [Router](#10-router)
    - [Reverse Proxy](#11-reverse-proxy)
    - [Rate Limiting](#12-rate-limiting)
    - [Retry Transport](#13-retry-transport)
    - [Circuit Breaker](#14-circuit-breaker)
    - [Cache Layer](#15-cache-layer)
+     - [Identity Cache (HybridStore)](#identity-cache-hybridstore)
+     - [Response Cache (ResponseCacheMiddleware)](#response-cache-responsecachemiddleware)
+   - [Middleware — Response Cache](#9-middleware) (see §9)
    - [Request Context](#16-request-context)
 6. [Function Reference](#function-reference)
 7. [Data Model & Relationships](#data-model--relationships)
@@ -326,9 +329,10 @@ api-gateway/
     │   └── json.go                   # writeJSON / writeJSONError
     │
     ├── middleware/
-    │   ├── logging.go                # LoggingMiddleware (+ request ID)
-    │   ├── api_key_auth_middleware.go        # X-API-Key → tenant in context
-    │   └── tenant_resolution_middleware.go   # Bearer + X-Tenant-ID → context
+    │   ├── logging.go                        # LoggingMiddleware (+ request ID)
+    │   ├── api_key_auth_middleware.go         # X-API-Key → tenant in context
+    │   ├── tenant_resolution_middleware.go    # Bearer + X-Tenant-ID → context
+    │   └── response_cache_middleware.go       # ResponseCacheMiddleware (tee writer, policy, key builder)
     │
     ├── server/
     │   ├── server.go                 # http.Server wrapper (Start)
@@ -354,7 +358,8 @@ api-gateway/
     │
     ├── cache/
     │   ├── memory.go                 # Store interface + MemoryStore (RWMutex, TTL, clock injection)
-    │   └── hybrid.go                 # HybridStore: remote-first reads, local-memory fallback
+    │   ├── hybrid.go                 # HybridStore: remote-first reads, local-memory fallback
+    │   └── response.go               # CachedResponse (status+headers+body), key builders, cache rules
     │
     └── pkg/
         ├── cacheclient/
@@ -613,6 +618,24 @@ API-key hash.
   the `Authorization: Bearer <token>` header and `X-Tenant-ID`, calls
   `TenantResolver.Resolve`, and stores the resolved **user**, **tenant**, and
   **membership** in context. Lets `OPTIONS` pass through.
+- **`ResponseCacheMiddleware`** (`response_cache_middleware.go`) — wraps the
+  proxy handler (or any `http.Handler`) to serve GET responses from cache and
+  capture new responses for storage. Key design decisions:
+  - **Policy-driven**: each route gets its own `ResponseCachePolicy` (TTL,
+    max body size, vary headers, cacheable status codes). Different routes can
+    have different lifetimes.
+  - **Tenant-isolated keys**: the key always includes `tenant:<id>` from the
+    resolved tenant in context. Tenant A can never receive Tenant B's cached
+    response.
+  - **`captureWriter` tee**: wraps `http.ResponseWriter` so the response bytes
+    flow normally to the client while simultaneously being captured. Implements
+    `Flusher`, `Hijacker`, and `Pusher` pass-throughs so streaming, WebSocket,
+    and HTTP/2 push handlers work unmodified behind the middleware.
+  - **Conservative eligibility**: only `GET` + `200 OK` + body within limit +
+    no `no-store`/`private`/`Set-Cookie` headers are stored. Anything outside
+    those bounds passes through without touching the cache.
+  - **Store-agnostic**: accepts `cache.Store` interface — works with
+    `MemoryStore` alone, `HybridStore`, or any future backend.
 
 ### 10. Router
 
@@ -1008,188 +1031,476 @@ service is down.
 - **`Delete`** — deletes from remote (ignoring errors), then deletes from local.
   Invalidation is best-effort everywhere.
 
-#### Data flow — cache on a proxied request
+#### Complete data flow — both cache layers on a live proxied request
 
 ```
-Incoming request
+Incoming GET /products   (X-API-Key: gw_live_…)
       │
       ▼
-APIKeyAuth / TenantResolution middleware
+LoggingMiddleware  ──────────────────────────────── assigns X-Request-ID
       │
-      │  key = "apikey:<hash>"  or  "tenant:<id>"
       ▼
-HybridStore.Get(ctx, key)
-      │
-      ├── remote.Get() ──► Cache Service (HTTP GET /v1/cache/gateway:<key>)
-      │       │                   │
-      │       │  hit              │ miss / unreachable
-      │       ▼                   ▼
-      │   value ◄──────── local.Get()  (fallback)
-      │       │                   │
-      │       │  (back-fill)      │ still miss
-      │       ▼                   ▼
-      │   local.Set(key, 30s)   DB query  (PostgreSQL)
-      │                           │
-      │                           ▼
-      │                       HybridStore.Set(ctx, key, value, ttl)
-      │                           ├── remote.Set()
-      │                           └── local.Set()
-      ▼
-  Resolved tenant / key → request context → rate limiter → proxy
-```
-
-On a **cache hit** (the common path at steady state): no DB query, ~1 ms round
-trip to the remote service or sub-microsecond from local memory.
-
-On a **cache miss** (cold start, TTL expiry, or invalidation): one DB query,
-then both layers are populated for the next request.
-
-On **remote cache failure** (network partition, service restart): the local layer
-absorbs reads for its TTL window; the gateway keeps serving without error. When
-the remote comes back up, the next `Set` call repopulates it automatically.
-
-#### User flow — how caching changes each journey
-
-**Flow A — Tenant Onboarding** (no caching involved)
-Onboarding creates records in the DB. It does not write to the cache. The first
-proxied request *after* onboarding will be a cache miss and will populate both
-layers.
-
-**Flow B — Human Login** (no caching involved)
-Login reads from DB for credential verification. Caching login responses would
-risk serving stale passwords. Login is not cached.
-
-**Flow C — Machine request via API key** (cache speeds up auth)
-
-```
-X-API-Key: gw_live_…
-      │
 APIKeyAuthMiddleware
+      │  key = "apikey:<sha256-hex>"
+      ├─ HybridStore.Get ──► remote.Get  (HTTP cache service)
+      │       │  hit ◄──────────────────── cached tenant+key bytes
+      │       │  miss / unreachable ──► local.Get  (in-process MemoryStore)
+      │       │                hit ◄──── bytes (30 s back-fill TTL)
+      │       │                miss ──► DB query (PostgreSQL)
+      │                                  │  DB result
+      │                                  └─► HybridStore.Set("apikey:<hash>", 5 min)
+      │                                          ├── remote.Set
+      │                                          └── local.Set
       │
-      ▼  HybridStore.Get("apikey:<sha256-hash>")
+      ▼  ResolvedTenant + ResolvedAPIKey placed in request context
       │
-      ├─ hit  → tenant + key resolved in <1 ms (no DB)
-      └─ miss → DB lookup → HybridStore.Set(…, 5 min TTL)
+      ▼
+RateLimitMiddleware  (reads tenant from context, token-bucket check)
+      │  429 if over budget, else continue
+      ▼
+ResponseCacheMiddleware  (wraps the proxy handler)
+      │
+      │  1. shouldCacheMethod("GET") → true
+      │  2. buildKey → "route-cache|tenant:<id>|GET|/products"
+      │  3. store.Get(key)
+      │         │
+      │         ├─ HIT  → FromBytes → IsValid → Apply(w) ───────────► Client
+      │         │                                           (no upstream call)
+      │         │
+      │         └─ MISS → wrap w in captureWriter
+      │                         │
+      ▼                         ▼
+Proxy Handler  ──────────────────────── forwards to upstream
+      │  ReverseProxy.Director: rewrite URL, inject X-Gateway-* headers
+      │  retry.Transport (+ circuit breaker transport)
+      │
+      ▼
+Upstream Service (e.g. api.acme.internal)
+      │  returns HTTP 200 + headers + body
+      ▼
+ReverseProxy.ModifyResponse  ── applies response transforms
+      │
+      ▼  captureWriter intercepts bytes on the way back
+      │  Write()       → tees body to buffer AND to real ResponseWriter (client)
+      │  WriteHeader() → copies local headers to real writer, stores statusCode
+      │
+      ▼  ResponseCacheMiddleware (post-handler checks)
+      │  shouldCacheStatus(200)           → true
+      │  tooLarge (body > MaxBodyBytes)   → false
+      │  IsCacheableResponse              → checks no-store/private/Set-Cookie
+      │         │  cacheable
+      │         ▼
+      │  ToBytes() → store.Set(key, data, TTL)
+      │                ├── remote.Set  (HTTP PUT)
+      │                └── local.Set  (in-process map)
+      ▼
+Client  ─────────────────── already received the response via captureWriter
 ```
 
-On the second and subsequent requests with the same API key the middleware
-resolves the caller's identity entirely from cache — the database is not touched.
+**What happens at each cache state:**
 
-**Flow D — Human request via JWT + tenant** (cache speeds up tenant lookup)
+| Scenario | Auth layer | Response layer | Upstream calls |
+|---|---|---|---|
+| Cold start (both layers empty) | DB query → populates both | DB query → populates both | 1 upstream call |
+| Warm (identity cached, response not yet) | Cache hit (no DB) | Response miss | 1 upstream call |
+| Fully warm (both cached) | Cache hit | Cache hit | **0 upstream calls** |
+| Remote cache down | Local memory hit or DB miss | Local memory hit or upstream call | depends |
+| Response `no-store` header | Cache hit | Skipped — never stored | 1 upstream call always |
+| Body > MaxBodyBytes | Cache hit | Stored locally but not in remote | 1 upstream call |
+
+---
+
+#### User flows — how caching changes each journey
+
+**Flow A — Tenant Onboarding** (no caching)
+
+Onboarding creates records in the DB inside a single transaction. It does not
+touch the cache at all. The first proxied request after onboarding is a cache
+miss for both the identity and response layers; subsequent requests benefit fully.
+
+---
+
+**Flow B — Human Login** (no caching)
+
+Login reads the user record from DB for credential verification (PBKDF2, which
+is deliberately slow). Caching login responses would risk serving stale passwords
+after a password change. Login is never cached.
+
+---
+
+**Flow C — Machine request via API key** (both cache layers active)
 
 ```
-Authorization: Bearer <jwt>
-X-Tenant-ID: <tenant-id>
-      │
+POST/GET /any-route    X-API-Key: gw_live_…
+         │
+         ▼
+APIKeyAuthMiddleware
+         │
+         │  cache key = "apikey:<sha256-hex-of-key>"
+         │
+         ├─ HIT (≥2nd request with same key)
+         │      → tenant + APIKey resolved from cache  (no DB)
+         │      → placed in context
+         │      → continue to rate limiter
+         │
+         └─ MISS (first request, or TTL expired)
+                → SHA-256 hash the raw key
+                → DB: SELECT … FROM api_keys WHERE key_hash = ?
+                → DB: SELECT … FROM tenants WHERE id = ?
+                → HybridStore.Set("apikey:<hash>", serialized, 5 min)
+                → continue to rate limiter
+         │
+         ▼
+RateLimitMiddleware  (KeyTenantAPIKey — tenant+key bucket)
+         │
+         ▼
+ResponseCacheMiddleware  (only for GET; POST always bypasses)
+         │
+         ├─ GET  → key = "route-cache|tenant:<id>|GET|/path[|query]"
+         │         → cache HIT  → serve from cache, zero upstream cost
+         │         → cache MISS → proxy → capture → store → serve
+         │
+         └─ POST → skip response cache, proxy directly
+```
+
+**Practical effect**: an API key that powers a read-heavy integration (e.g. a
+product catalog widget polling `GET /products` every few seconds) pays the DB
+cost exactly *once per TTL window* instead of on every request.
+
+---
+
+**Flow D — Human request via JWT + tenant** (identity cache active, response cache active for GET)
+
+```
+GET /orders    Authorization: Bearer <jwt>    X-Tenant-ID: <tenant-id>
+         │
+         ▼
 TenantResolutionMiddleware
-      │  JWT verified locally (no DB, no cache — signatures are self-contained)
-      │
-      ▼  HybridStore.Get("tenant:<tenant-id>")
-      │
-      ├─ hit  → tenant struct resolved from cache
-      └─ miss → DB lookup → HybridStore.Set(…, 5 min TTL)
-      │
-      ▼  HybridStore.Get("membership:<user-id>:<tenant-id>")
-      │
-      ├─ hit  → role/status from cache
-      └─ miss → DB lookup → HybridStore.Set(…, 5 min TTL)
+         │
+         │  Step 1: verify JWT signature (HS256, constant-time hmac.Equal)
+         │          ← pure crypto, no DB, no cache
+         │
+         │  Step 2: load tenant
+         │          cache key = "tenant:<tenant-id>"
+         │          ├─ HIT  → tenant from cache (no DB)
+         │          └─ MISS → DB → HybridStore.Set("tenant:<id>", 5 min)
+         │
+         │  Step 3: load membership
+         │          cache key = "membership:<user-id>:<tenant-id>"
+         │          ├─ HIT  → role + status from cache (no DB)
+         │          └─ MISS → DB → HybridStore.Set("membership:…", 5 min)
+         │
+         ▼  AuthenticatedUser + ResolvedTenant + ResolvedMembership in context
+         │
+         ▼
+RateLimitMiddleware  (KeyTenantUser — per-user-per-tenant bucket)
+         │
+         ▼
+ResponseCacheMiddleware
+         │  key = "route-cache|tenant:<id>|GET|/orders[|query][|accept=…]"
+         │
+         ├─ HIT  → replay full HTTP response (status + headers + body)
+         └─ MISS → proxy → capture → conditional store → serve
 ```
 
-JWT verification is cryptographic and requires no network call. Only the tenant
-record and membership look-ups benefit from caching, but those are the most
-expensive operations in the resolution path.
+> **VaryHeaders in practice**: if the route is registered with
+> `VaryHeaders: ["Accept"]`, then `GET /products Accept: application/json` and
+> `GET /products Accept: text/html` are stored as separate entries. This is
+> important for APIs that serve both JSON and HTML from the same path.
+
+---
 
 #### What is **not** cached
 
 | Thing | Why not cached |
 |---|---|
-| Password verification | Security — must always hash against the stored value |
-| JWT signatures | Self-verifying — no external call needed |
-| Usage records | Writes, not reads |
-| Onboarding / login requests | Low frequency, correctness trumps speed |
-| Upstream responses | Not implemented yet — see R9 |
+| Password verification | Security — must always verify against the stored hash |
+| JWT signature verification | Cryptographic, self-contained — no DB or network needed |
+| Usage / metering records | Writes, not reads |
+| Onboarding / login endpoints | Low-frequency control plane; correctness over speed |
+| Non-200 upstream responses | Errors should not be persisted (may be transient) |
+| Responses with `Cache-Control: no-store` or `private` | Upstream explicitly forbids sharing |
+| Responses with `Set-Cookie` | User-specific data must never be shared across callers |
+| Bodies > MaxBodyBytes | Prevents runaway memory growth |
+| Non-GET requests | POST/PUT/DELETE are not idempotent — wrong to replay |
+
+---
+
+#### Response Cache (ResponseCacheMiddleware)
+
+**Why response caching on top of identity caching?**
+
+Identity caching (above) removes DB round-trips during auth. Response caching
+goes one step further: for **safe, idempotent GET requests** whose upstream
+responses are stable over time, the gateway can serve the entire response from
+cache — no DB query, no upstream call, no compute cost on the backend at all.
+
+```
+Without response cache (every request):
+  Client → Gateway → DB (auth) → Upstream → Client
+
+With identity cache:
+  Client → Gateway → Cache (auth) → Upstream → Client   ← DB saved
+
+With response cache (cache hit):
+  Client → Gateway → Cache (full response) → Client      ← DB + Upstream saved
+```
+
+Response caching is a separate concern from identity caching and sits at a
+different layer — it wraps the proxy handler, not the auth middleware.
+
+---
+
+**Package: `internal/cache` — `response.go`**
+
+This file contains the building blocks for storing and replaying HTTP responses.
+
+**`CachedResponse`** — the complete HTTP response snapshot:
+
+```go
+type CachedResponse struct {
+    StatusCode int         // e.g. 200
+    Header     http.Header // all response headers
+    Body       []byte      // raw response body
+    StoredAt   time.Time   // when it was cached
+}
+```
+
+Storing status + headers + body together means a cache hit is
+**indistinguishable to the client** from a live upstream response. If we only
+stored the body, we would lose `Content-Type`, `Cache-Control`, custom headers,
+etc., and would have to reconstruct them imperfectly.
+
+**Serialization helpers:**
+
+| Function | What it does |
+|---|---|
+| `Marshal(resp)` / `ToBytes()` | JSON-encode a `CachedResponse` → `[]byte` for storage |
+| `Unmarshal(data)` / `FromBytes(data)` | Restore `CachedResponse` from stored `[]byte` |
+| `Record(statusCode, header, body)` | Build a `CachedResponse` from a live response; deep-copies both headers and body so the caller's buffers can be safely reused |
+| `CloneHeader(h)` | Deep-copy an `http.Header` map (avoids shared-reference mutations) |
+| `(r CachedResponse).Apply(w)` | Replay the cached response to an `http.ResponseWriter` — copies all headers with `Add` (preserves multi-value headers), writes status, writes body |
+| `(r CachedResponse).IsValid()` | Guards against replaying a corrupt/zero-value cache entry |
+
+**Key construction:**
+
+| Function | Example output | Purpose |
+|---|---|---|
+| `BuildKey(parts...)` | `"tenant-1\|GET\|/products"` | Joins non-empty parts with `\|` separator |
+| `StableRequestPart(method, path, query)` | `"GET\|/products\|page=1"` | Normalizes method (upper), path (cleaned), query into the request fragment of a key |
+| `cleanPath(p)` | `"/products/"` → `"/products"` | Strips trailing slash, ensures leading slash — prevents duplicate keys for the same resource |
+
+**Cache-eligibility guards:**
+
+| Function | Rule |
+|---|---|
+| `CacheableMethod(method)` | Only `GET` is cacheable by default |
+| `IsCacheableResponse(resp, maxBytes)` | Requires `200 OK`; rejects body > `maxBytes`; rejects `Cache-Control: no-store` or `private`; rejects `Set-Cookie` (user-specific data must not be shared) |
+| `DefaultTTL()` | Returns `30s` — the safe starter lifetime |
+
+---
+
+**Package: `internal/middleware` — `response_cache_middleware.go`**
+
+**`ResponseCachePolicy`** — per-route configuration injected at startup:
+
+```go
+type ResponseCachePolicy struct {
+    TTL               time.Duration  // how long to cache (default 30s)
+    MaxBodyBytes      int            // body size cap (default 1 MiB)
+    VaryHeaders       []string       // request headers that split cache entries (e.g. "Accept")
+    CacheableStatuses []int          // which status codes to cache (default [200])
+    KeyPrefix         string         // optional namespace prefix
+}
+```
+
+Different routes can have different policies:
+
+| Route | TTL | Notes |
+|---|---|---|
+| `GET /health` | 5 s | Cheap; changes rarely |
+| `GET /products` | 60 s | List; acceptable staleness |
+| `GET /users/me` | 0 (no cache) | Personal data; use `Set-Cookie` guard |
+| `POST /orders` | — | Never cached (method guard) |
+
+**`ResponseCacheMiddleware` — how it works internally:**
+
+`NewResponseCacheMiddleware(store, policy)` validates the policy once at startup
+(normalization into `policyState` converts `[]int` status lists to `map[int]struct{}`
+for O(1) lookup on the hot path) and returns a standard `func(http.Handler) http.Handler`.
+
+Per request:
+
+```
+1. Method check        → non-GET skips all cache logic, calls next directly
+2. Key build           → needs ResolvedTenant from context (missing = skip cache)
+3. Store.Get(key)      → cache HIT: FromBytes → IsValid → Apply → return
+4. Cache MISS:
+   a. wrap w with captureWriter
+   b. call next (proxy handler) — client receives response normally
+   c. check shouldCacheStatus  → non-200 (or non-configured code) → skip store
+   d. check tooLarge           → body exceeded MaxBodyBytes → skip store
+   e. check IsCacheableResponse → no-store / private / Set-Cookie → skip store
+   f. ToBytes → Store.Set(key, data, ttl)
+```
+
+**`captureWriter` — the tee writer:**
+
+This is the technical centrepiece of response caching. A standard
+`http.ResponseWriter` sends bytes to the client and forgets them. To cache the
+response, the middleware needs to intercept those bytes without breaking anything.
+
+`captureWriter` is a thin wrapper that satisfies the full `http.ResponseWriter`
+interface *plus* `http.Flusher`, `http.Hijacker`, and `http.Pusher` so it is safe
+to use in front of a reverse proxy, WebSocket upgrade, or HTTP/2 push handler:
+
+| Interface | Why it matters |
+|---|---|
+| `Header() http.Header` | Returns the *local* header map; the handler writes here, headers are copied to the real writer on `WriteHeader` |
+| `WriteHeader(code)` | Once-only guard (`wroteHeader`); copies local headers → real writer; stores `statusCode` for cache capture |
+| `Write(p)` | Tees bytes: writes to `body` buffer *and* to the real writer; stops capturing if `tooLarge` (body still flows to client) |
+| `Flush()` | Passes through to real writer if it implements `http.Flusher` — required for streaming/SSE/proxy |
+| `Hijack()` | Passes through to real writer — required for WebSocket upgrades |
+| `Push()` | Passes through to real writer — required for HTTP/2 server push |
+| `Unwrap()` | Returns the original `http.ResponseWriter` for middleware that needs it |
+
+The key invariant: **the client always receives the normal response**, regardless
+of whether caching succeeds or the body is too large.
+
+**Cache key format:**
+
+```
+[keyPrefix|]tenant:<tenant-id>|METHOD|/path[|query][|header=value...]
+```
+
+Examples:
+
+```
+route-cache|tenant:abc123|GET|/products
+route-cache|tenant:abc123|GET|/products|page=2
+route-cache|tenant:abc123|GET|/products|accept=application/json
+```
+
+The tenant ID is always part of the key, drawn from the resolved tenant in the
+request context. This is the **tenant-isolation safety guarantee**: tenant A's
+response for `GET /products` is stored under a different key from tenant B's,
+even if their upstreams return the same bytes.
+
+---
+
+#### Identity Cache (HybridStore)
+
+*(covered above — the HybridStore section)*
+
+---
 
 #### What remains to wire up
 
-The cache packages are **fully implemented and compile cleanly** but are not
-yet instantiated anywhere:
+All three cache packages — `cacheclient`, `cache` (MemoryStore + HybridStore +
+CachedResponse), and `middleware/response_cache_middleware` — are **fully
+implemented and compile cleanly** but nothing instantiates them yet. Five
+concrete wiring steps remain:
 
-1. **`Config.CacheConfig`** needs to be added to `internal/config/config.go`
-   with env vars `CACHE_REMOTE_URL`, `CACHE_TIMEOUT`, `CACHE_NAMESPACE`,
-   `CACHE_TOKEN`.
-2. **`main.go` / bootstrap** needs to construct a `RemoteClient` (or skip if
-   `CACHE_REMOTE_URL` is blank) and a `HybridStore`, then pass the store to the
-   auth middleware constructors.
-3. **Middleware integration** — `APIKeyAuthMiddleware` and
-   `TenantResolutionMiddleware` need `HybridStore` injected so they read from
-   cache before hitting the DB, and write back on a miss.
-4. **`PruneExpired` goroutine** — a background ticker (e.g. every 5 min) should
-   call `MemoryStore.PruneExpired()` to evict stale local entries.
+1. **Config env vars** — add `CacheConfig` struct to `internal/config/config.go`:
+   `CACHE_REMOTE_URL` (blank = local-only fallback), `CACHE_TIMEOUT` (default
+   2 s), `CACHE_NAMESPACE` (default `"gateway"`), `CACHE_TOKEN` (optional
+   Bearer token for the remote cache service).
 
-See [TODO.md](TODO.md) items **R9** and **B1** for the full wiring checklist.
+2. **Bootstrap** — in `main.go` / `server.New`: if `CACHE_REMOTE_URL` is
+   non-blank, call `cacheclient.NewRemoteClient(...)` and pass it to
+   `cache.NewHybridStore(remote, nil)`. Otherwise use
+   `cache.NewHybridStore(nil, nil)` (local-only). Pass the `HybridStore` to
+   every consumer.
+
+3. **Identity cache injection** — `APIKeyAuthMiddleware` and
+   `TenantResolutionMiddleware` need a `cache.Store` parameter so they can call
+   `Get` before the DB and `Set` on a miss. Suggested keys and TTLs:
+   - `"apikey:<sha256-hex>"` → 5 min
+   - `"tenant:<tenant-id>"` → 5 min
+   - `"membership:<user-id>:<tenant-id>"` → 5 min
+
+4. **Response cache injection** — for each proxied route register with:
+   ```go
+   mw, _ := middleware.NewResponseCacheMiddleware(store, middleware.ResponseCachePolicy{
+       TTL:          60 * time.Second,
+       MaxBodyBytes: 1 << 20, // 1 MiB
+       KeyPrefix:    "rc",
+   })
+   router.GET("/products", mw(proxyHandler))
+   ```
+   The `ResponseCachePolicy.VaryHeaders` field lets per-route config split
+   cache entries by `Accept`, `Accept-Language`, etc.
+
+5. **`PruneExpired` goroutine** — start a background `time.Ticker` (e.g. every
+   5 min) that calls `memoryStore.PruneExpired()` to reclaim stale in-process
+   entries. This is especially important because the memory store grows
+   unboundedly otherwise.
+
+See [TODO.md](TODO.md) items **R9** and **B1** for the full checklist.
 
 <!-- IMAGE: replace this line with the generated diagram -->
-![Cache Layer — Hybrid Read Path](docs/images/15-cache-hybrid.png)
+![Cache Layer — Full Request Path](docs/images/15-cache-full.png)
 
 <details>
-<summary><b>🎨 Gemini prompt — Cache Layer: Hybrid Store & Read Path</b> (save as <code>docs/images/15-cache-hybrid.png</code>)</summary>
+<summary><b>🎨 Gemini prompt — Cache Layer: Identity cache + Response cache end-to-end</b> (save as <code>docs/images/15-cache-full.png</code>)</summary>
 
 ```text
 [PASTE THE SHARED STYLE PREAMBLE FIRST]
 
-DIAGRAM: "Cache Layer — Hybrid Store: remote-first reads, local-memory fallback"
+DIAGRAM: "Full Cache Path — Identity Cache + Response Cache end-to-end"
 
-Draw TWO side-by-side flows on the canvas, sharing a common top box.
+Draw a TALL TOP-TO-BOTTOM flow with two distinct cache decision points.
+Title banner: "Two-layer caching: identity resolution + full response replay".
 
-SHARED TOP (blue box): "🌐 Incoming request — auth middleware needs tenant/key"
+STAGE 1 (blue): "🌐 Incoming GET request (X-API-Key or Bearer+X-Tenant-ID)"
 
-=== LEFT FLOW: "GET path (read)" ===
-Flow downward:
+STAGE 2 (green): "LoggingMiddleware — assign X-Request-ID"
 
-1) YELLOW box "HybridStore.Get(ctx, key)"
-   Arrow down labeled "1. try remote first"
+STAGE 3 — IDENTITY CACHE (yellow band labeled "Auth / Resolution Middleware"):
+  Draw a small fork decision inside this band:
+  diamond "HybridStore.Get('apikey:<hash>' or 'tenant:<id>')"
+    ├── GREEN "✅ HIT → resolved from cache (no DB)" → continue
+    └── RED "❌ MISS →" small sub-flow:
+          PURPLE "RemoteClient.Get (HTTP cache service)"
+            ├── hit → back-fill local, continue
+            └── miss → ORANGE "MemoryStore.Get" → hit or miss
+                              miss → ORANGE "🗄️ DB query"
+                                        └── HybridStore.Set (remote + local, 5 min TTL)
+  Result: "ResolvedTenant + APIKey/User/Membership → request context"
 
-2) PURPLE box "🌐 RemoteClient.Get → HTTP GET /v1/cache/gateway:<key>"
-   TWO branches out:
-   - GREEN right branch "✅ 200 hit" → small note "back-fill local.Set(30s)" → "return value"
-   - RED left branch "❌ 404 miss / transport error"
-     Arrow down labeled "2. fallback"
+STAGE 4 (green): "🚦 RateLimitMiddleware — token bucket"
 
-3) ORANGE box "MemoryStore.Get(key)"
-   TWO branches out:
-   - GREEN right branch "✅ hit → return value (no DB)"
-   - RED left branch "❌ miss → DB query (PostgreSQL)"
-     Arrow down
+STAGE 5 — RESPONSE CACHE (green band labeled "ResponseCacheMiddleware"):
+  Two sub-boxes:
+  A) diamond "Method = GET?" → NO → "skip cache, call next directly"
+  B) "Build key: route-cache|tenant:<id>|GET|/path[|query][|vary-header=val]"
+  C) diamond "store.Get(key)"
+       ├── GREEN "✅ HIT → FromBytes → IsValid → Apply(w) → CLIENT ←────────┐
+       │              (no upstream call at all)"                             │
+       └── RED "❌ MISS →"                                                  │
+               small box "wrap w in captureWriter (tee writer)"             │
+               arrow down                                                    │
 
-4) ORANGE box "🗄️ PostgreSQL — full query"
-   Arrow down
+STAGE 6 (purple): "➡️ Proxy Handler → RetryTransport → CircuitBreakerTransport → Upstream"
+  Upstream box returns response
 
-5) YELLOW box "HybridStore.Set(key, value, TTL)"
-   TWO arrows down from it:
-   - To purple "RemoteClient.Set (PUT /v1/cache/...)"
-   - To orange "MemoryStore.Set (in-process RAM)"
+STAGE 7 — RESPONSE CAPTURE (back in the ResponseCacheMiddleware band):
+  "captureWriter.Write() — bytes flow to client AND to body buffer simultaneously"
+  diamond "shouldCacheStatus? AND !tooLarge? AND IsCacheableResponse?"
+    ├── NO (no-store / Set-Cookie / body too large / non-200) → "skip store"
+    └── YES → "ToBytes() → store.Set(key, data, TTL)"
+                  ├── PURPLE "RemoteClient.Set (PUT /v1/cache/...)"
+                  └── ORANGE "MemoryStore.Set (in-process map)"
 
-=== RIGHT FLOW: "SET / DELETE path (write/invalidate)" ===
-(shorter, next to the GET flow)
+STAGE 8 (blue): "CLIENT — receives response (same bytes whether from cache or upstream)"
 
-1) YELLOW box "HybridStore.Set(ctx, key, value, ttl)"
-   TWO parallel arrows:
-   - PURPLE "remote.Set() — PUT /v1/cache/gateway:<key>  body: {value:base64, ttl_seconds:N}"
-   - ORANGE "local.Set() — always, regardless of remote outcome"
+Add a small LEGEND box:
+  "STAGE 3 = identity cache: removes DB cost on auth"
+  "STAGE 5+7 = response cache: removes upstream cost on repeated GETs"
+  "captureWriter = tee writer: client always gets the response; cache is opportunistic"
+  "🚧 both cache layers not yet wired into main.go (R9)"
 
-2) YELLOW box "HybridStore.Delete(ctx, key)"
-   TWO parallel arrows:
-   - PURPLE "remote.Delete() — DELETE /v1/cache/gateway:<key>"
-   - ORANGE "local.Delete()"
-
-Add a small LEGEND / key box:
-  "Remote failure (network / timeout) → silently ignored, local still updated"
-  "Local TTL on back-fill: 30s  (keeps local warm during short remote outages)"
-  "PruneExpired() sweeps stale local entries — call on a 5-min ticker"
-
-Tag both flows with 🚧 "cache not yet injected into middleware (see R9)".
-
-Hand-drawn Excalidraw style, clean two-column layout, clear color coding.
+Hand-drawn Excalidraw style, tall portrait layout, color-coded stages.
 ```
 
 </details>
@@ -1247,6 +1558,7 @@ A condensed map of the most important exported functions/types by package.
 - `LoggingMiddleware(next) http.Handler`.
 - `NewAPIKeyAuthMiddleware(next, authenticator) http.Handler`.
 - `NewTenantResolutionMiddleware(next, resolver) http.Handler`.
+- `NewResponseCacheMiddleware(store cache.Store, policy ResponseCachePolicy) (func(http.Handler) http.Handler, error)` — normalizes policy once at startup; returns a standard middleware wrapper. `ResponseCachePolicy` fields: `TTL`, `MaxBodyBytes`, `VaryHeaders`, `CacheableStatuses`, `KeyPrefix`.
 
 ### `proxy`
 - `NewHandler(reg Registry, logger) (*Handler, error)` → `ServeHTTP`.
@@ -1273,6 +1585,16 @@ A condensed map of the most important exported functions/types by package.
 - `(*MemoryStore).Get/Set/Delete/PruneExpired` — `Store` interface + lazy expiry on read.
 - `NewHybridStore(remote cacheclient.Client, local *MemoryStore) *HybridStore` — nil-safe; auto-creates local if nil.
 - `(*HybridStore).Get/Set/Delete` — remote-first reads, always-write-both sets.
+- `Record(statusCode, header, body) CachedResponse` — deep-copy capture of a live response.
+- `(CachedResponse).Apply(w http.ResponseWriter)` — replay status + headers + body to client.
+- `(CachedResponse).ToBytes() / FromBytes(data)` — JSON serialization round-trip.
+- `(CachedResponse).IsValid() bool` — guard against corrupt/zero-value entries.
+- `BuildKey(parts...) string` — join with `|` separator, skip empties.
+- `StableRequestPart(method, path, query) string` — normalised request fragment for a cache key.
+- `CacheableMethod(method) bool` — `true` only for `GET`.
+- `IsCacheableResponse(resp, maxBytes) bool` — `200 OK`, size limit, no no-store/private/Set-Cookie.
+- `DefaultTTL() time.Duration` — `30s` starter lifetime.
+- `CloneHeader(h) http.Header` — deep-copy headers (prevents shared-reference mutation).
 
 ### `circuit_breaker`
 - `New(policy models.CircuitBreakerPolicy) (*Breaker, error)` — normalize policy + start CLOSED.
@@ -2163,6 +2485,8 @@ The **Notes** column links each area to the relevant [TODO.md](TODO.md) item(s).
 | Remote cache client (HTTP + base64)    |   ✅   |        ❌        | Built; no env config or middleware injection → R9 |
 | In-process memory cache (TTL, prune)   |   ✅   |        ❌        | Built; not injected into middleware → R9 |
 | Hybrid cache (remote-first + fallback) |   ✅   |        ❌        | Built; not wired into auth middleware → R9 |
+| `CachedResponse` (serialisation, replay, key builders) | ✅ | ❌ | Built; consumed by ResponseCacheMiddleware → R9 |
+| Response cache middleware (`captureWriter`, policy) | ✅ | ❌ | Built; not registered on any route → R9 |
 | Rate limiting (token bucket)           |   ✅   |        ❌        | In-memory; not routed → R1 |
 | Usage metering                         |   ⚠️   |        ❌        | Model+repo exist; no writer → B4, R4 |
 | Refresh-token endpoint                 |   ❌   |        ❌        | Service exists; no handler → R5 |
