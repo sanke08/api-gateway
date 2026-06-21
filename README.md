@@ -98,7 +98,8 @@ STYLE: Hand-drawn whiteboard diagram in the Excalidraw / Eraser.io aesthetic.
    - [Rate Limiting](#12-rate-limiting)
    - [Retry Transport](#13-retry-transport)
    - [Circuit Breaker](#14-circuit-breaker)
-   - [Request Context](#15-request-context)
+   - [Cache Layer](#15-cache-layer)
+   - [Request Context](#16-request-context)
 6. [Function Reference](#function-reference)
 7. [Data Model & Relationships](#data-model--relationships)
 8. [User Flows](#user-flows)
@@ -183,6 +184,7 @@ The intended design is a clean, layered architecture with a fast request path:
    │                                                            └► Upstream      │
    │                                                                            │
    │   Service layer:  Onboarding · Auth · APIKeyAuth · TenantResolution · JWT   │
+   │   Cache layer:    HybridStore (RemoteClient + MemoryStore fallback)         │
    │   Repository layer (thin, SQL-only, transaction-aware via WithTx)          │
    │   PostgreSQL                                                               │
    └──────────────────────────────────────────────────────────────────────────┘
@@ -350,9 +352,16 @@ api-gateway/
     │   ├── breaker.go                # Breaker state machine (CLOSED/OPEN/HALF_OPEN) + Policy
     │   └── transport.go              # http.RoundTripper that gates traffic through the breaker
     │
-    └── pkg/types/
-        ├── path_params.go            # Path-param context helpers
-        └── request_context.go        # Typed context keys for resolved identity
+    ├── cache/
+    │   ├── memory.go                 # Store interface + MemoryStore (RWMutex, TTL, clock injection)
+    │   └── hybrid.go                 # HybridStore: remote-first reads, local-memory fallback
+    │
+    └── pkg/
+        ├── cacheclient/
+        │   └── client.go             # Client interface + RemoteClient (HTTP, base64, namespaced keys)
+        └── types/
+            ├── path_params.go        # Path-param context helpers
+            └── request_context.go    # Typed context keys for resolved identity
 ```
 
 <!-- IMAGE: replace this line with the generated diagram -->
@@ -916,7 +925,276 @@ Hand-drawn Excalidraw style, clear state boxes, labeled arrows, portrait or squa
 
 </details>
 
-### 15. Request Context
+### 15. Cache Layer
+
+The cache layer gives the gateway a fast, resilient place to store short-lived
+data — tenant records, resolved API keys, JWT validation results — so the same
+DB query is not repeated on every request.
+
+#### Why a cache at all?
+
+Every authenticated request today hits PostgreSQL at least twice: once for the
+API key / JWT lookup, and once for the tenant record. Under moderate load that is
+thousands of identical reads per second. The cache absorbs those reads so the
+database handles only writes and cache misses.
+
+#### Why two layers (remote + local)?
+
+| Layer | Where | Survives process restart? | Shared across replicas? |
+|---|---|---|---|
+| Remote (`RemoteClient`) | External HTTP cache service | Yes | Yes |
+| Local (`MemoryStore`) | Process RAM | No | No |
+
+A single remote cache is the shared source of truth across all gateway replicas,
+but it adds a network hop. A single in-process map is zero-latency but is lost on
+restart and invisible to other replicas. `HybridStore` gets the best of both: it
+reads remote first, writes to both, and falls back to local when the remote
+service is down.
+
+#### Package: `internal/pkg/cacheclient`
+
+**`client.go`** — the remote cache contract and HTTP implementation.
+
+- **`Client` interface** — three methods: `Get`, `Set`, `Delete`. Everything
+  in the gateway that touches a cache depends on this interface, not a concrete
+  type. Swapping Redis, Memcached, or a custom HTTP service requires only a new
+  `Client` implementation.
+- **`RemoteClient`** — a stateless HTTP client that talks to an external cache
+  service over a simple REST API:
+  - `GET  /v1/cache/<namespace>:<key>` → `200 {"value":"<base64>"}`  or `404`
+  - `PUT  /v1/cache/<namespace>:<key>` body `{"value":"<base64>","ttl_seconds":<n>}`
+  - `DELETE /v1/cache/<namespace>:<key>`
+  - Keys are URL-path-escaped; values are base64-encoded so any binary payload
+    survives JSON transport.
+  - One `*http.Client` is created at startup and reused for all requests —
+    enabling TCP keep-alive and connection pooling.
+  - A `namespace` prefix (e.g. `gateway`) prevents key collisions when multiple
+    services share the same cache cluster.
+  - An optional `Bearer` token is sent on every request for auth.
+- **Sentinel errors** — `ErrNotFound` (key missing), `ErrInvalidKey` (empty
+  key), `ErrInvalidTTL` (zero/negative TTL) — let callers distinguish a cache
+  miss from a transport failure with `errors.Is`.
+- **`NewRemoteClient(baseURL, timeout, namespace, token)`** — validates scheme +
+  host at construction time (fail-fast); defaults `timeout` to 2s.
+
+#### Package: `internal/cache`
+
+**`memory.go`** — the local in-process fallback.
+
+- **`Store` interface** — `Get/Set/Delete/PruneExpired`. Any local cache backend
+  (map, LRU, etc.) can satisfy this.
+- **`MemoryStore`** — a `sync.RWMutex`-protected `map[string]memoryItem`.
+  Each `memoryItem` carries the raw `[]byte` value, an `expiresAt` time, and a
+  `hasExpiry` flag (so zero-TTL entries are stored permanently without comparing
+  against the zero `time.Time`). `Get` does lazy expiry deletion on read.
+  `PruneExpired` does a full sweep — call it on a timer goroutine to reclaim
+  memory.
+- **Clock injection** — `NewMemoryStoreWithClock(clock func() time.Time)` lets
+  tests freeze or advance time without `time.Sleep`. `NewMemoryStore()` uses
+  `time.Now` for production.
+- **Copy-on-read** — `Get` copies bytes out before returning so callers cannot
+  mutate the internal buffer.
+
+**`hybrid.go`** — the two-layer coordinator.
+
+- **`HybridStore`** wraps a `cacheclient.Client` (remote) and a `*MemoryStore`
+  (local). Neither is required — passing `nil` for either degrades gracefully.
+- **`Get`** — remote first: on success, back-fills local with a 30 s TTL and
+  returns. On `ErrNotFound` *or* any remote error, falls through to local. The
+  local copy may be stale but it keeps the gateway functioning when the remote
+  service is temporarily unavailable.
+- **`Set`** — writes remote (ignoring errors), then always writes local. Both
+  layers are kept warm on every write regardless of remote health.
+- **`Delete`** — deletes from remote (ignoring errors), then deletes from local.
+  Invalidation is best-effort everywhere.
+
+#### Data flow — cache on a proxied request
+
+```
+Incoming request
+      │
+      ▼
+APIKeyAuth / TenantResolution middleware
+      │
+      │  key = "apikey:<hash>"  or  "tenant:<id>"
+      ▼
+HybridStore.Get(ctx, key)
+      │
+      ├── remote.Get() ──► Cache Service (HTTP GET /v1/cache/gateway:<key>)
+      │       │                   │
+      │       │  hit              │ miss / unreachable
+      │       ▼                   ▼
+      │   value ◄──────── local.Get()  (fallback)
+      │       │                   │
+      │       │  (back-fill)      │ still miss
+      │       ▼                   ▼
+      │   local.Set(key, 30s)   DB query  (PostgreSQL)
+      │                           │
+      │                           ▼
+      │                       HybridStore.Set(ctx, key, value, ttl)
+      │                           ├── remote.Set()
+      │                           └── local.Set()
+      ▼
+  Resolved tenant / key → request context → rate limiter → proxy
+```
+
+On a **cache hit** (the common path at steady state): no DB query, ~1 ms round
+trip to the remote service or sub-microsecond from local memory.
+
+On a **cache miss** (cold start, TTL expiry, or invalidation): one DB query,
+then both layers are populated for the next request.
+
+On **remote cache failure** (network partition, service restart): the local layer
+absorbs reads for its TTL window; the gateway keeps serving without error. When
+the remote comes back up, the next `Set` call repopulates it automatically.
+
+#### User flow — how caching changes each journey
+
+**Flow A — Tenant Onboarding** (no caching involved)
+Onboarding creates records in the DB. It does not write to the cache. The first
+proxied request *after* onboarding will be a cache miss and will populate both
+layers.
+
+**Flow B — Human Login** (no caching involved)
+Login reads from DB for credential verification. Caching login responses would
+risk serving stale passwords. Login is not cached.
+
+**Flow C — Machine request via API key** (cache speeds up auth)
+
+```
+X-API-Key: gw_live_…
+      │
+APIKeyAuthMiddleware
+      │
+      ▼  HybridStore.Get("apikey:<sha256-hash>")
+      │
+      ├─ hit  → tenant + key resolved in <1 ms (no DB)
+      └─ miss → DB lookup → HybridStore.Set(…, 5 min TTL)
+```
+
+On the second and subsequent requests with the same API key the middleware
+resolves the caller's identity entirely from cache — the database is not touched.
+
+**Flow D — Human request via JWT + tenant** (cache speeds up tenant lookup)
+
+```
+Authorization: Bearer <jwt>
+X-Tenant-ID: <tenant-id>
+      │
+TenantResolutionMiddleware
+      │  JWT verified locally (no DB, no cache — signatures are self-contained)
+      │
+      ▼  HybridStore.Get("tenant:<tenant-id>")
+      │
+      ├─ hit  → tenant struct resolved from cache
+      └─ miss → DB lookup → HybridStore.Set(…, 5 min TTL)
+      │
+      ▼  HybridStore.Get("membership:<user-id>:<tenant-id>")
+      │
+      ├─ hit  → role/status from cache
+      └─ miss → DB lookup → HybridStore.Set(…, 5 min TTL)
+```
+
+JWT verification is cryptographic and requires no network call. Only the tenant
+record and membership look-ups benefit from caching, but those are the most
+expensive operations in the resolution path.
+
+#### What is **not** cached
+
+| Thing | Why not cached |
+|---|---|
+| Password verification | Security — must always hash against the stored value |
+| JWT signatures | Self-verifying — no external call needed |
+| Usage records | Writes, not reads |
+| Onboarding / login requests | Low frequency, correctness trumps speed |
+| Upstream responses | Not implemented yet — see R9 |
+
+#### What remains to wire up
+
+The cache packages are **fully implemented and compile cleanly** but are not
+yet instantiated anywhere:
+
+1. **`Config.CacheConfig`** needs to be added to `internal/config/config.go`
+   with env vars `CACHE_REMOTE_URL`, `CACHE_TIMEOUT`, `CACHE_NAMESPACE`,
+   `CACHE_TOKEN`.
+2. **`main.go` / bootstrap** needs to construct a `RemoteClient` (or skip if
+   `CACHE_REMOTE_URL` is blank) and a `HybridStore`, then pass the store to the
+   auth middleware constructors.
+3. **Middleware integration** — `APIKeyAuthMiddleware` and
+   `TenantResolutionMiddleware` need `HybridStore` injected so they read from
+   cache before hitting the DB, and write back on a miss.
+4. **`PruneExpired` goroutine** — a background ticker (e.g. every 5 min) should
+   call `MemoryStore.PruneExpired()` to evict stale local entries.
+
+See [TODO.md](TODO.md) items **R9** and **B1** for the full wiring checklist.
+
+<!-- IMAGE: replace this line with the generated diagram -->
+![Cache Layer — Hybrid Read Path](docs/images/15-cache-hybrid.png)
+
+<details>
+<summary><b>🎨 Gemini prompt — Cache Layer: Hybrid Store & Read Path</b> (save as <code>docs/images/15-cache-hybrid.png</code>)</summary>
+
+```text
+[PASTE THE SHARED STYLE PREAMBLE FIRST]
+
+DIAGRAM: "Cache Layer — Hybrid Store: remote-first reads, local-memory fallback"
+
+Draw TWO side-by-side flows on the canvas, sharing a common top box.
+
+SHARED TOP (blue box): "🌐 Incoming request — auth middleware needs tenant/key"
+
+=== LEFT FLOW: "GET path (read)" ===
+Flow downward:
+
+1) YELLOW box "HybridStore.Get(ctx, key)"
+   Arrow down labeled "1. try remote first"
+
+2) PURPLE box "🌐 RemoteClient.Get → HTTP GET /v1/cache/gateway:<key>"
+   TWO branches out:
+   - GREEN right branch "✅ 200 hit" → small note "back-fill local.Set(30s)" → "return value"
+   - RED left branch "❌ 404 miss / transport error"
+     Arrow down labeled "2. fallback"
+
+3) ORANGE box "MemoryStore.Get(key)"
+   TWO branches out:
+   - GREEN right branch "✅ hit → return value (no DB)"
+   - RED left branch "❌ miss → DB query (PostgreSQL)"
+     Arrow down
+
+4) ORANGE box "🗄️ PostgreSQL — full query"
+   Arrow down
+
+5) YELLOW box "HybridStore.Set(key, value, TTL)"
+   TWO arrows down from it:
+   - To purple "RemoteClient.Set (PUT /v1/cache/...)"
+   - To orange "MemoryStore.Set (in-process RAM)"
+
+=== RIGHT FLOW: "SET / DELETE path (write/invalidate)" ===
+(shorter, next to the GET flow)
+
+1) YELLOW box "HybridStore.Set(ctx, key, value, ttl)"
+   TWO parallel arrows:
+   - PURPLE "remote.Set() — PUT /v1/cache/gateway:<key>  body: {value:base64, ttl_seconds:N}"
+   - ORANGE "local.Set() — always, regardless of remote outcome"
+
+2) YELLOW box "HybridStore.Delete(ctx, key)"
+   TWO parallel arrows:
+   - PURPLE "remote.Delete() — DELETE /v1/cache/gateway:<key>"
+   - ORANGE "local.Delete()"
+
+Add a small LEGEND / key box:
+  "Remote failure (network / timeout) → silently ignored, local still updated"
+  "Local TTL on back-fill: 30s  (keeps local warm during short remote outages)"
+  "PruneExpired() sweeps stale local entries — call on a 5-min ticker"
+
+Tag both flows with 🚧 "cache not yet injected into middleware (see R9)".
+
+Hand-drawn Excalidraw style, clean two-column layout, clear color coding.
+```
+
+</details>
+
+### 16. Request Context
 
 **`internal/pkg/types/`** centralizes typed context keys so identity flows
 through the pipeline without globals:
@@ -981,6 +1259,20 @@ A condensed map of the most important exported functions/types by package.
 
 ### `retry`
 - `NewTransport(next http.RoundTripper, policy Policy) (*Transport, error)` → `RoundTrip`.
+
+### `cacheclient`
+- `NewRemoteClient(baseURL, timeout, namespace, token) (*RemoteClient, error)` — validate + build HTTP client.
+- `(*RemoteClient).Get(ctx, key) ([]byte, error)` — HTTP GET; returns `ErrNotFound` on 404.
+- `(*RemoteClient).Set(ctx, key, value, ttl) error` — HTTP PUT with base64 value + TTL seconds.
+- `(*RemoteClient).Delete(ctx, key) error` — HTTP DELETE.
+- Sentinels: `ErrNotFound`, `ErrInvalidKey`, `ErrInvalidTTL`.
+
+### `cache`
+- `NewMemoryStore() *MemoryStore` — production in-process cache (uses `time.Now`).
+- `NewMemoryStoreWithClock(clock) *MemoryStore` — test-friendly clock injection.
+- `(*MemoryStore).Get/Set/Delete/PruneExpired` — `Store` interface + lazy expiry on read.
+- `NewHybridStore(remote cacheclient.Client, local *MemoryStore) *HybridStore` — nil-safe; auto-creates local if nil.
+- `(*HybridStore).Get/Set/Delete` — remote-first reads, always-write-both sets.
 
 ### `circuit_breaker`
 - `New(policy models.CircuitBreakerPolicy) (*Breaker, error)` — normalize policy + start CLOSED.
@@ -1377,6 +1669,9 @@ The fully-assembled request path the components are built for:
             ▼
         Auth/Resolution middleware  ── put identity in request context
             │  (X-API-Key → tenant+key)   OR   (Bearer + X-Tenant-ID → user+tenant+membership)
+            │
+            │  resolution reads from HybridStore first (remote cache → local memory → DB on miss)
+            │  DB miss writes back to both cache layers for subsequent requests
             ▼
         Rate-limit middleware  ── token bucket by key → 429 + Retry-After if over
             │
@@ -1695,8 +1990,8 @@ Because the mux has **no routes** and nothing else is wired:
 
 - Every request is logged and answered with **`404 page not found`**.
 - The database is **never opened** (`config.NewDatabase` is unused).
-- Repositories, services, handlers, router, proxy, rate limiter, and circuit
-  breaker are **compiled but never instantiated** at runtime.
+- Repositories, services, handlers, router, proxy, rate limiter, circuit
+  breaker, and cache layer are **compiled but never instantiated** at runtime.
 
 In other words: **the building blocks are written and individually coherent, but
 the application is not assembled.** Wiring it together (in `server.New` or a new
@@ -1730,7 +2025,8 @@ runtime)". Draw these as a loose grid of DASHED-outline gray boxes, each with a
   "Repositories ×5", "Onboarding / Auth / APIKeyAuth / TenantResolution
   services", "JWTManager", "APIKeyAuth & TenantResolution middleware",
   "Handlers (/onboard, /login)", "Proxy + StaticRegistry", "RateLimiter",
-  "RetryTransport", "CircuitBreakerTransport".
+  "RetryTransport", "CircuitBreakerTransport",
+  "RemoteClient + MemoryStore + HybridStore (cache)".
   Caption under the grid: "All compile; go vet is clean; none are referenced by
   main.go."
 
@@ -1864,6 +2160,9 @@ The **Notes** column links each area to the relevant [TODO.md](TODO.md) item(s).
 | Request/response transforms            |   ✅   |        ❌        | Headers + path only (no body) |
 | Retry transport (backoff+jitter)       |   ✅   |     ⚠️ via proxy  | Reachable only via proxy; cleanup → C4 |
 | Circuit breaker (CLOSED/OPEN/HALF_OPEN)|   ✅   |     ⚠️ via proxy  | Transport layer; not wired end-to-end yet → R1 |
+| Remote cache client (HTTP + base64)    |   ✅   |        ❌        | Built; no env config or middleware injection → R9 |
+| In-process memory cache (TTL, prune)   |   ✅   |        ❌        | Built; not injected into middleware → R9 |
+| Hybrid cache (remote-first + fallback) |   ✅   |        ❌        | Built; not wired into auth middleware → R9 |
 | Rate limiting (token bucket)           |   ✅   |        ❌        | In-memory; not routed → R1 |
 | Usage metering                         |   ⚠️   |        ❌        | Model+repo exist; no writer → B4, R4 |
 | Refresh-token endpoint                 |   ❌   |        ❌        | Service exists; no handler → R5 |
@@ -1893,7 +2192,9 @@ In rough priority order to get from "library" to "running gateway":
    chain `APIKeyAuth`/`TenantResolution` → `ratelimit` → `proxy.Handler` on the
    proxied routes.
 4. **Move secrets/policies into config:** JWT secret/issuer/TTLs, rate-limit
-   rules, and upstream definitions (env or a config file / DB table).
+   rules, upstream definitions, and cache settings (`CACHE_REMOTE_URL`,
+   `CACHE_TIMEOUT`, `CACHE_NAMESPACE`, `CACHE_TOKEN`) into env vars.
+   Wire `HybridStore` into auth middlewares and start a `PruneExpired` goroutine.
 5. **Persist upstreams & usage:** add an `upstreams` table + repository, and
    write `Usage` rows from the proxy path (capture bytes in/out).
 6. **Add a refresh endpoint** and (later) token revocation using the `jti`.

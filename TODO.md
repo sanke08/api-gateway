@@ -17,8 +17,8 @@ as you complete them. Full context for each item is in
 | --------------------------------------- | :--: | :---: |
 | 🔴 P0 — Blocking (app cannot run)        |  0   |   9   |
 | 🟡 P1 — Correctness / cleanliness        |  0   |   6   |
-| 🟢 P2 — Build-out / roadmap              |  0   |   8   |
-| **TOTAL**                               |  **0** | **23** |
+| 🟢 P2 — Build-out / roadmap              |  0   |   9   |
+| **TOTAL**                               |  **0** | **24** |
 
 _Last updated: 2026-06-21_
 
@@ -130,6 +130,29 @@ _Last updated: 2026-06-21_
   goroutine for the rate limiter, and a real migration runner.
 - [ ] **R8 — Admin / dashboard API.** Tenant management + usage analytics
   endpoints (not started).
+- [ ] **R9 — Wire the cache layer.** The cache packages (`cacheclient`,
+  `cache.MemoryStore`, `cache.HybridStore`) are fully built but never
+  instantiated. Four steps are required:
+  1. **Config** — add `CacheConfig` to `internal/config/config.go` with env
+     vars `CACHE_REMOTE_URL` (blank = local-only), `CACHE_TIMEOUT` (default 2s),
+     `CACHE_NAMESPACE` (default `"gateway"`), `CACHE_TOKEN` (optional Bearer
+     token for the remote cache service).
+  2. **Bootstrap** — in `main.go` / `server.New`: construct a `RemoteClient`
+     when `CACHE_REMOTE_URL` is non-blank, wrap it with `NewHybridStore`, and
+     pass the store to middleware constructors.
+  3. **Middleware injection** — `APIKeyAuthMiddleware` and
+     `TenantResolutionMiddleware` should accept a `*cache.HybridStore` (or
+     `cache.Store`) and use `Get` before hitting the DB; call `Set` on a miss.
+     Suggested key scheme: `apikey:<sha256-hex>`, `tenant:<tenant-id>`,
+     `membership:<user-id>:<tenant-id>`. Suggested TTL: 5 min (tune via config).
+  4. **Pruning goroutine** — start a background `time.Ticker` (every 5 min) that
+     calls `MemoryStore.PruneExpired()` to reclaim stale in-process entries.
+  - Files: [internal/config/config.go](internal/config/config.go),
+    [internal/cmd/gateway/main.go](internal/cmd/gateway/main.go),
+    [internal/server/server.go](internal/server/server.go),
+    [internal/middleware/api_key_auth_middleware.go](internal/middleware/api_key_auth_middleware.go),
+    [internal/middleware/tenant_resolution_middleware.go](internal/middleware/tenant_resolution_middleware.go)
+  - ⛓️ Depends on: B1 (app must be assembled first).
 
 ---
 
@@ -156,6 +179,9 @@ Components that are **built and individually coherent** today (compile clean,
 | Request/response transforms | ⚠️ Built | Headers + path only (no body) |
 | Retry transport (backoff+jitter) | ⚠️ Built | Reachable only via the proxy |
 | Circuit breaker (CLOSED/OPEN/HALF_OPEN + Transport) | ⚠️ Built | Transport layer implemented; not wired end-to-end yet (R1) |
+| Remote cache client (`cacheclient.RemoteClient`) | ⚠️ Built | HTTP + base64; no env config, not injected into middleware (R9) |
+| In-process cache (`cache.MemoryStore`) | ⚠️ Built | RWMutex, TTL, clock injection, PruneExpired; not injected (R9) |
+| Hybrid cache (`cache.HybridStore`) | ⚠️ Built | Remote-first + local fallback; not wired into auth path (R9) |
 | Rate limiter (token bucket) | ⚠️ Built | In-memory; not routed (R1) |
 
 > ✅ Done = complete as intended · ⚠️ Built = code exists & compiles but is not
@@ -168,6 +194,7 @@ Components that are **built and individually coherent** today (compile clean,
 - Usage writing from the request path → **R4**
 - Admin / dashboard API → **R8**
 - Tests → **C6**
+- Cache config env vars + middleware injection → **R9** (packages built; wiring not started)
 
 ---
 
@@ -180,7 +207,7 @@ B4 ─┼─► (fix schema)  ─► B6 ─┐
 B5 ─┘                        ├─► (repos work) ─► B1 (wire /onboard, /login)
                   B7 ─ B8 ─ B9 ┘                        │
                                                         ▼
-                                  C1 C2 C3 C5 (cleanups)  ─► R1 (data plane)
+                                  C1 C2 C3 C5 (cleanups)  ─► R1 (data plane) ─► R9 (cache wiring)
                                                               │
                                                 R2 R3 R4 R5 … ┘  ─► C6 (tests throughout)
 ```
