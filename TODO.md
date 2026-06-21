@@ -17,10 +17,10 @@ as you complete them. Full context for each item is in
 | --------------------------------------- | :--: | :---: |
 | 🔴 P0 — Blocking (app cannot run)        |  0   |   9   |
 | 🟡 P1 — Correctness / cleanliness        |  0   |   6   |
-| 🟢 P2 — Build-out / roadmap              |  0   |   9   |
-| **TOTAL**                               |  **0** | **24** |
+| 🟢 P2 — Build-out / roadmap              |  0   |  10   |
+| **TOTAL**                               |  **0** | **25** |
 
-_Last updated: 2026-06-21 (added response cache middleware)_
+_Last updated: 2026-06-21 (added observability subsystem)_
 
 ---
 
@@ -130,6 +130,33 @@ _Last updated: 2026-06-21 (added response cache middleware)_
   goroutine for the rate limiter, and a real migration runner.
 - [ ] **R8 — Admin / dashboard API.** Tenant management + usage analytics
   endpoints (not started).
+- [ ] **R10 — Wire the observability layer.** The metrics registry, trace, and
+  observability middleware are fully built but never instantiated. Five steps:
+  1. **Bootstrap** — call `observability.NewRegistry()` in `main.go` and pass
+     the `*Registry` to every component that needs to record metrics.
+  2. **Router middleware** — add `router.Use(observability.Middleware(reg))`
+     so every request automatically gets a trace and timing metrics without
+     any per-handler code.
+  3. **`/metrics` endpoint** — register `router.GET("/metrics", reg.MetricsHandler())`
+     so Prometheus (or any scraper) can pull metrics. Consider protecting it
+     behind an internal-only route or basic auth.
+  4. **Component wiring** — pass `reg` to:
+     - `retry.Transport` → call `reg.RecordRetry(labels)` per retry attempt
+     - `circuitbreaker.Breaker` (or its `Transport`) → call `reg.RecordBreakerOpen/Closed`
+       when state transitions occur
+     - `ResponseCacheMiddleware` → call `observability.RecordCacheHit/Miss`
+     - `APIKeyAuthMiddleware` / `TenantResolutionMiddleware` → call
+       `RecordCacheHit/Miss` for identity cache lookups
+  5. **Trace propagation** — downstream handlers that need the `RequestID`
+     (e.g. proxy error handler, access logs) should call `TraceFromContext(ctx)`.
+  - Files: [internal/cmd/gateway/main.go](internal/cmd/gateway/main.go),
+    [internal/server/server.go](internal/server/server.go),
+    [internal/retry/transport.go](internal/retry/transport.go),
+    [internal/circuit_breaker/transport.go](internal/circuit_breaker/transport.go),
+    [internal/middleware/response_cache_middleware.go](internal/middleware/response_cache_middleware.go),
+    [internal/middleware/api_key_auth_middleware.go](internal/middleware/api_key_auth_middleware.go),
+    [internal/middleware/tenant_resolution_middleware.go](internal/middleware/tenant_resolution_middleware.go)
+  - ⛓️ Depends on: B1 (app must be assembled first).
 - [ ] **R9 — Wire the cache layer.** All cache packages are fully built and
   compile cleanly but nothing instantiates them. Five steps are required:
   1. **Config** — add `CacheConfig` struct to `internal/config/config.go` with
@@ -192,6 +219,10 @@ Components that are **built and individually coherent** today (compile clean,
 | Hybrid cache (`cache.HybridStore`) | ⚠️ Built | Remote-first + local fallback; not wired into auth path (R9) |
 | `CachedResponse` + key builders (`cache/response.go`) | ⚠️ Built | Serialisation, replay, eligibility guards; consumed by response cache middleware (R9) |
 | Response cache middleware (`middleware/response_cache_middleware.go`) | ⚠️ Built | captureWriter tee, per-policy normalisation, tenant-isolated keys; not registered on any route (R9) |
+| Metrics registry (`observability/registry.go`) | ⚠️ Built | counters/gauges/durations, Prometheus text `/metrics`; `NewRegistry()` never called (R10) |
+| Labels + Trace (`observability/labels.go`, `trace.go`) | ⚠️ Built | Stable label strings, per-request ID/timing; not attached to any request path (R10) |
+| Observability middleware (`observability/middleware.go`) | ⚠️ Built | Records timing+bytes+status per request; not wired to router (R10) |
+| Cache observability helpers (`observability/helper.go`) | ⚠️ Built | `RecordCacheHit/Miss`; cache middleware doesn't call them yet (R10) |
 | Rate limiter (token bucket) | ⚠️ Built | In-memory; not routed (R1) |
 
 > ✅ Done = complete as intended · ⚠️ Built = code exists & compiles but is not
@@ -206,6 +237,8 @@ Components that are **built and individually coherent** today (compile clean,
 - Tests → **C6**
 - Cache config env vars + identity middleware injection → **R9** (packages built; wiring not started)
 - Response cache middleware registration on proxied routes → **R9**
+- `NewRegistry()` + `observability.Middleware` + `/metrics` endpoint → **R10** (packages built; wiring not started)
+- `RecordRetry`, `RecordBreakerOpen/Closed`, `RecordCacheHit/Miss` wired into transports/middleware → **R10**
 
 ---
 
@@ -218,7 +251,7 @@ B4 ─┼─► (fix schema)  ─► B6 ─┐
 B5 ─┘                        ├─► (repos work) ─► B1 (wire /onboard, /login)
                   B7 ─ B8 ─ B9 ┘                        │
                                                         ▼
-                                  C1 C2 C3 C5 (cleanups)  ─► R1 (data plane) ─► R9 (cache wiring)
+                                  C1 C2 C3 C5 (cleanups)  ─► R1 (data plane) ─► R9 (cache) ─► R10 (observability)
                                                               │
                                                 R2 R3 R4 R5 … ┘  ─► C6 (tests throughout)
 ```

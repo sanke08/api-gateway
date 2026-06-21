@@ -86,7 +86,7 @@ STYLE: Hand-drawn whiteboard diagram in the Excalidraw / Eraser.io aesthetic.
 5. [Layer-by-Layer Walkthrough](#layer-by-layer-walkthrough)
    - [Entry Point & Server](#1-entry-point--server)
    - [Configuration](#2-configuration)
-   - [Observability](#3-observability)
+   - [Observability](#3-observability) (Registry · Labels · Trace · Middleware · /metrics)
    - [Domain Models](#4-domain-models)
    - [Database & Migrations](#5-database--migrations)
    - [Repository Layer](#6-repository-layer)
@@ -188,6 +188,7 @@ The intended design is a clean, layered architecture with a fast request path:
    │                                                                            │
    │   Service layer:  Onboarding · Auth · APIKeyAuth · TenantResolution · JWT   │
    │   Cache layer:    HybridStore (RemoteClient + MemoryStore fallback)         │
+   │   Observability:  Registry (metrics) · Trace (per-request) · /metrics      │
    │   Repository layer (thin, SQL-only, transaction-aware via WithTx)          │
    │   PostgreSQL                                                               │
    └──────────────────────────────────────────────────────────────────────────┘
@@ -282,7 +283,13 @@ api-gateway/
     │   └── validator.go              # Validate(Config) required-field checks
     │
     ├── observability/
-    │   └── logger.go                 # slog JSON logger: InitLogger/Info/Error
+    │   ├── logger.go                 # slog JSON logger: InitLogger/Info/Error
+    │   ├── registry.go               # Registry: in-memory counters/gauges/durations, /metrics Prometheus text
+    │   ├── labels.go                 # Labels map: Clone, String (sorted, stable)
+    │   ├── trace.go                  # Trace struct: per-request ID, timing, status; context helpers
+    │   ├── middleware.go             # Middleware(reg): wraps every request, records metrics + trace
+    │   ├── writer.go                 # responseWriter: observe-only tee (status code + bytes, Flusher/Hijacker/Pusher)
+    │   └── helper.go                 # RecordCacheHit/RecordCacheMiss shorthands for cache middleware wiring
     │
     ├── models/                       # Pure domain structs (no behavior)
     │   ├── tenant.go                 # Tenant + status/role/membership enums
@@ -469,13 +476,194 @@ reads env with typed helpers:
 
 ### 3. Observability
 
-**`internal/observability/logger.go`** — a package-global `*slog.Logger`.
-`InitLogger()` installs a `slog.NewJSONHandler(os.Stdout, nil)`.
-`Info(msg, kv...)` / `Error(msg, kv...)` are thin wrappers.
+The observability package has grown from a single logger into a full
+in-process telemetry system: structured logging, per-request tracing,
+a Prometheus-compatible metrics registry, and an HTTP middleware that ties
+them all together automatically for every request.
 
-> If any `Info`/`Error` is called before `InitLogger()`, the global is `nil` and
-> it will panic. `config.Validate` logs errors via `observability.Error`, but
-> `main.go` does call `InitLogger()` first, so the normal path is safe.
+#### Why a custom metrics registry?
+
+The gateway has no external dependencies beyond `lib/pq`. Adding Prometheus
+client libraries would break that constraint. The `Registry` gives the same
+observability signals (counters, gauges, duration summaries) with zero
+third-party code, and exposes them in the Prometheus text format that any
+existing scraper can read.
+
+---
+
+#### `logger.go` — structured logging
+
+Package-global `*slog.Logger`. `InitLogger()` installs a
+`slog.NewJSONHandler(os.Stdout, nil)`. `Info(msg, kv...)` / `Error(msg, kv...)`
+are thin wrappers.
+
+> If called before `InitLogger()` the global is `nil` and panics. `main.go`
+> calls `InitLogger()` first, so the normal startup path is safe.
+
+---
+
+#### `labels.go` — metric dimensions
+
+**`Labels`** (`map[string]string`) tags every metric with key/value pairs
+so one metric name can be sliced by tenant, route, method, and status.
+
+| Method | What it does |
+|---|---|
+| `Labels.Clone()` | Deep-copies the map using `maps.Copy` — the registry always stores its own copy so caller mutations do not corrupt stored metrics |
+| `Labels.String()` | Sorts keys alphabetically and formats as `key="val",key="val"` — stable output regardless of Go map iteration order; used as the sync.Map lookup key |
+
+Example:
+```
+Labels{"tenant":"abc","method":"GET","route":"/products","status":"200"}
+→  method="GET",route="/products",status="200",tenant="abc"
+```
+
+---
+
+#### `registry.go` — in-memory metrics store
+
+**`Registry`** holds three `sync.Map`s — one each for counters, gauges, and
+durations. All updates use `atomic.Int64` so there are no locks on the hot path.
+
+**Metric types:**
+
+| Type | Behaviour | Examples |
+|---|---|---|
+| **Counter** (`counterMetric`) | Monotonically increasing; `atomic.Add` | `gateway_requests_total`, `gateway_cache_hits_total`, `gateway_retries_total` |
+| **Gauge** (`gaugeMetric`) | Can go up or down; `atomic.Store` | `gateway_circuit_breaker_open` (0=closed, 1=open), `gateway_up_time_seconds` |
+| **Duration** (`durationMetric`) | Stores `count` + `sumNS`; both `atomic.Add` | `gateway_request_duration_seconds` |
+
+**Key design — `metricKey(name, labels)`:**  
+Every unique `(name, labelSet)` pair maps to its own metric object:
+```
+gateway_requests_total|method="GET",tenant="abc"   → counterMetric{value=150}
+gateway_requests_total|method="GET",tenant="xyz"   → counterMetric{value=42}
+```
+`getCounter/getGauge/getDuration` use `LoadOrStore` for a lock-free
+create-once pattern safe under concurrent requests.
+
+**High-level recording helpers:**
+
+| Method | Metrics written |
+|---|---|
+| `RecordRequest(labels, duration, bytes)` | `gateway_requests_total +1`, `gateway_request_duration_seconds`, `gateway_response_bytes_total += bytes` |
+| `RecordError(labels)` | `gateway_request_errors_total +1` |
+| `RecordCacheHit(labels)` | `gateway_cache_hits_total +1` |
+| `RecordCacheMiss(labels)` | `gateway_cache_misses_total +1` |
+| `RecordRetry(labels)` | `gateway_retries_total +1` |
+| `RecordBreakerOpen(labels)` | `gateway_circuit_breaker_open = 1` |
+| `RecordBreakerClosed(labels)` | `gateway_circuit_breaker_open = 0` |
+
+**`/metrics` endpoint — `MetricsHandler()`:**  
+Returns a Prometheus text format response. All three `sync.Map`s are iterated,
+rendered via `renderCounter`/`renderGauge`/`renderDuration`, then sorted for
+deterministic output. Example scrape:
+
+```
+# TYPE gateway_requests_total counter
+gateway_requests_total{method="GET",route="/products",status="200",tenant="abc"} 1250
+
+# TYPE gateway_request_duration_seconds summary
+gateway_request_duration_seconds_count{method="GET",route="/products",status="200",tenant="abc"} 1250
+gateway_request_duration_seconds_sum{method="GET",route="/products",status="200",tenant="abc"} 84.312500000
+
+# TYPE gateway_cache_hits_total counter
+gateway_cache_hits_total{route="/products",tenant="abc"} 1100
+
+# TYPE gateway_circuit_breaker_open gauge
+gateway_circuit_breaker_open{tenant="abc",upstream="orders-api"} 0
+
+# TYPE gateway_up_time_seconds gauge
+gateway_up_time_seconds 3600
+```
+
+---
+
+#### `trace.go` — per-request identity
+
+**`Trace`** stores everything that identifies and times one request:
+
+```go
+type Trace struct {
+    RequestID    string        // hex-encoded 16 random bytes (or from X-Request-ID)
+    StartedAt    time.Time
+    EndedAt      time.Time
+    Duration     time.Duration
+    Method       string        // e.g. GET
+    Path         string        // e.g. /products
+    TenantID     string        // resolved from context, or "unknown"
+    StatusCode   int           // final HTTP status
+    BytesWritten int64         // response body size
+}
+```
+
+`NewTrace(r)` reads `X-Request-ID` from the request header first (for
+correlation with upstream logs); falls back to `crypto/rand` 16-byte hex.
+`WithTrace` / `TraceFromContext` store and retrieve the pointer via an
+unexported `traceContextKey{}` so no other package can collide with it.
+
+---
+
+#### `writer.go` — observe-only response wrapper
+
+**`responseWriter`** embeds `http.ResponseWriter` and adds `statusCode` + `bytesWritten` tracking — the minimal observer needed for metrics. It passes `WriteHeader` once (guarded by `wroteHeader`) and accumulates bytes in `Write`. Implements `Flusher`, `Hijacker`, `Pusher`, and `Unwrap` pass-throughs so the full capability of the underlying writer is preserved.
+
+> This is the **lightweight** observer (metrics-only). `captureWriter` in
+> `cache/response_cache_middleware.go` is the **heavy** observer that also
+> buffers the entire body for storage.
+
+---
+
+#### `middleware.go` — the observability entry point
+
+**`Middleware(reg *Registry)`** is a standard `func(http.Handler) http.Handler`
+that should wrap every route or the entire router:
+
+```
+Per request:
+  1. time.Now() → startedAt
+  2. NewTrace(r) → trace (RequestID, method, path)
+  3. WithTrace(ctx, trace) → enriched context propagated downstream
+  4. wrap w with responseWriter (observe-only)
+  5. next.ServeHTTP(wrapped, r.WithContext(ctx))
+  6. time.Now() → endedAt; duration = endedAt - startedAt
+  7. trace.EndedAt, Duration, StatusCode, BytesWritten ← filled in
+  8. tenantID ← ResolvedTenantFromContext (or "unknown" if not yet resolved)
+  9. labels = {tenant, method, route, status}
+ 10. reg.RecordRequest(labels, duration, bytesWritten)
+ 11. if status ≥ 400 → reg.RecordError(labels)
+```
+
+If `reg` is nil the middleware is a transparent pass-through, so it is safe to
+use even before a registry is constructed.
+
+---
+
+#### `helper.go` — cache observability shorthands
+
+`RecordCacheHit(reg, tenantID, route)` and `RecordCacheMiss(reg, tenantID, route)` are one-line wrappers that build the `Labels` map and call the registry. They exist so future cache middleware wiring reads:
+
+```go
+observability.RecordCacheHit(reg, tenant.Id, r.URL.Path)
+```
+
+instead of building the labels map at every call site.
+
+---
+
+#### Complete metric catalogue
+
+| Metric name | Type | Labels | What it measures |
+|---|---|---|---|
+| `gateway_up_time_seconds` | gauge | — | Process uptime since `NewRegistry()` |
+| `gateway_requests_total` | counter | tenant, method, route, status | Every completed HTTP request |
+| `gateway_request_duration_seconds` | summary | tenant, method, route, status | Request latency (count + sum for avg) |
+| `gateway_response_bytes_total` | counter | tenant, method, route, status | Total response bytes sent to clients |
+| `gateway_request_errors_total` | counter | tenant, method, route, status | Requests returning HTTP 4xx or 5xx |
+| `gateway_cache_hits_total` | counter | tenant, route | Responses served from cache |
+| `gateway_cache_misses_total` | counter | tenant, route | Cache lookups that fell through to DB/upstream |
+| `gateway_retries_total` | counter | (caller-supplied) | Retry attempts by the retry transport |
+| `gateway_circuit_breaker_open` | gauge | (caller-supplied) | Current breaker state: 0=closed, 1=open |
 
 ### 4. Domain Models
 
@@ -1528,7 +1716,20 @@ A condensed map of the most important exported functions/types by package.
 - `Validate(*Config) error` — required-field checks.
 
 ### `observability`
-- `InitLogger()`, `Info(msg, kv...)`, `Error(msg, kv...)`.
+- `InitLogger()`, `Info(msg, kv...)`, `Error(msg, kv...)` — structured JSON logger (logger.go).
+- `NewRegistry() *Registry` — create the in-memory metrics store.
+- `(*Registry).RecordRequest(labels, duration, bytes)` — counter + duration + bytes in one call.
+- `(*Registry).RecordError(labels)` — increment `gateway_request_errors_total`.
+- `(*Registry).RecordCacheHit/RecordCacheMiss(labels)` — cache efficiency counters.
+- `(*Registry).RecordRetry(labels)` — retry attempt counter.
+- `(*Registry).RecordBreakerOpen/RecordBreakerClosed(labels)` — set circuit breaker gauge.
+- `(*Registry).SetGauge/ObserveDuration/incCounter/addCounter` — primitives (lowercase = internal).
+- `(*Registry).MetricsHandler() http.Handler` — Prometheus text scrape endpoint.
+- `Labels` (`map[string]string`) + `Labels.Clone()` + `Labels.String()` (sorted) — metric tagging.
+- `NewTrace(r *http.Request) *Trace` — create per-request trace (reads/generates `X-Request-ID`).
+- `WithTrace(ctx, trace) context.Context` / `TraceFromContext(ctx) (*Trace, bool)` — context helpers.
+- `Middleware(reg *Registry) func(http.Handler) http.Handler` — records timing, bytes, status per request.
+- `RecordCacheHit(reg, tenantID, route)` / `RecordCacheMiss(...)` — shorthand helpers (helper.go).
 
 ### `server`
 - `New(addr string) *Server`, `(*Server).Start() error`.
@@ -2072,6 +2273,109 @@ orientation.
 
 </details>
 
+#### Observability data flow — what gets measured and when
+
+The observability middleware wraps the outermost handler so every request,
+regardless of route, produces a trace and metrics:
+
+```
+Incoming request
+      │
+      ▼
+observability.Middleware(reg)          ← outermost wrapper
+      │  1. startedAt = time.Now()
+      │  2. trace = NewTrace(r)        (RequestID from X-Request-ID or crypto/rand)
+      │  3. ctx  = WithTrace(ctx, trace)
+      │  4. w    = &responseWriter{underlying: w}  (observe-only, never buffers)
+      │
+      ▼  next.ServeHTTP(w, r.WithContext(ctx))
+      │
+      │  ── all downstream middleware and handlers run here ──
+      │     auth → rate limit → response cache → proxy → upstream
+      │
+      ▼  (handler returns)
+      │  5. duration = time.Now() - startedAt
+      │  6. trace.{EndedAt, Duration, StatusCode, BytesWritten} filled in
+      │  7. tenantID = ResolvedTenantFromContext(ctx)  or "unknown"
+      │  8. labels = {tenant, method, route, status}
+      │
+      ├─ reg.RecordRequest(labels, duration, bytesWritten)
+      │       ├── gateway_requests_total          +1
+      │       ├── gateway_request_duration_seconds (count+1, sumNS+=duration)
+      │       └── gateway_response_bytes_total    +=bytesWritten
+      │
+      └─ if status ≥ 400:
+              reg.RecordError(labels)
+                  └── gateway_request_errors_total +1
+```
+
+**Cache observability** is recorded at the call site inside cache middleware:
+```
+ResponseCacheMiddleware — cache HIT:
+    observability.RecordCacheHit(reg, tenant.Id, r.URL.Path)
+        └── gateway_cache_hits_total{tenant=…,route=…} +1
+
+ResponseCacheMiddleware — cache MISS (after upstream call):
+    observability.RecordCacheMiss(reg, tenant.Id, r.URL.Path)
+        └── gateway_cache_misses_total{tenant=…,route=…} +1
+```
+
+**Circuit breaker observability** is recorded when breaker state changes:
+```
+Breaker CLOSED → OPEN:
+    reg.RecordBreakerOpen(Labels{"tenant":…,"upstream":…})
+        └── gateway_circuit_breaker_open{…} = 1
+
+Breaker HALF_OPEN → CLOSED:
+    reg.RecordBreakerClosed(Labels{"tenant":…,"upstream":…})
+        └── gateway_circuit_breaker_open{…} = 0
+```
+
+**Retry observability** is recorded inside `retry.Transport`:
+```
+After each retry attempt (not the first try):
+    reg.RecordRetry(labels)
+        └── gateway_retries_total{…} +1
+```
+
+**`GET /metrics`** — the scrape endpoint (to be registered on the router):
+```go
+router.GET("/metrics", reg.MetricsHandler())
+```
+The handler iterates all three `sync.Map`s, renders to Prometheus text format
+(sorted for determinism), and writes `Content-Type: text/plain; version=0.0.4`.
+
+#### User flows — what observability adds to each journey
+
+**Flow A — Onboarding / Flow B — Login** (control plane):
+Every call is counted in `gateway_requests_total` with `route=/onboard` or
+`route=/login`. Duration is recorded. Failures (400, 409, 500) increment
+`gateway_request_errors_total`. The trace carries a `RequestID` the client
+can use to correlate their error with a gateway log line.
+
+**Flow C — Machine request (API key)**:
+- Auth cache hit/miss → `gateway_cache_hits_total` / `gateway_cache_misses_total`
+- Response cache hit → `gateway_cache_hits_total` (no upstream call, ~0 ms latency visible in `gateway_request_duration_seconds`)
+- Retry → `gateway_retries_total` incremented per retry attempt
+- Circuit breaker trips → `gateway_circuit_breaker_open{upstream=…} = 1`; client gets 503; once upstream recovers → gauge resets to 0
+
+**Flow D — Human request (JWT + tenant)**:
+Same as Flow C for auth and response caching. Additionally, `tenantID` is
+populated from the resolved membership so all metrics are tenant-scoped.
+
+#### What is **not** yet wired for observability
+
+| Gap | What's needed |
+|---|---|
+| `observability.Middleware` not attached to router | Add `router.Use(observability.Middleware(reg))` in bootstrap |
+| `RecordCacheHit/Miss` not called | Cache middleware needs a `*Registry` parameter |
+| `RecordRetry` not called | `retry.Transport` needs a `*Registry` parameter |
+| `RecordBreakerOpen/Closed` not called | `circuit_breaker.Breaker` needs a `*Registry` parameter or callback |
+| `/metrics` not registered | `router.GET("/metrics", reg.MetricsHandler())` in bootstrap |
+| `NewRegistry()` not called | Bootstrap needs to create a registry and pass it everywhere |
+
+All these are tracked as part of **R10** in [TODO.md](TODO.md).
+
 ---
 
 ## Error Handling Pipeline
@@ -2313,7 +2617,8 @@ Because the mux has **no routes** and nothing else is wired:
 - Every request is logged and answered with **`404 page not found`**.
 - The database is **never opened** (`config.NewDatabase` is unused).
 - Repositories, services, handlers, router, proxy, rate limiter, circuit
-  breaker, and cache layer are **compiled but never instantiated** at runtime.
+  breaker, cache layer, and the metrics registry are **compiled but never
+  instantiated** at runtime (the logger is the sole live component).
 
 In other words: **the building blocks are written and individually coherent, but
 the application is not assembled.** Wiring it together (in `server.New` or a new
@@ -2469,6 +2774,10 @@ The **Notes** column links each area to the relevant [TODO.md](TODO.md) item(s).
 | Domain models                          |   ✅   |        —         | Complete |
 | Config loading & validation            |   ✅   |     ⚠️ partial    | DB never opened → B1, C5 |
 | Structured logging (slog + req ID)     |   ✅   |        ✅         | The one live component |
+| Metrics registry (counters/gauges/durations) | ✅ | ❌ | Built; `NewRegistry()` never called → R10 |
+| Per-request trace (`Trace` + context)  |   ✅   |        ❌        | Built; `Middleware` not attached → R10 |
+| Observability middleware (timing, bytes) | ✅   |        ❌        | Built; not wired to router → R10 |
+| `/metrics` Prometheus scrape endpoint  |   ✅   |        ❌        | `MetricsHandler()` exists; not registered → R10 |
 | SQL migrations                         |   ⚠️   |        ❌        | Buggy/mismatched → B2–B5, C2 |
 | Repository layer (CRUD + tx)           |   ✅   |        ❌        | SQL mismatches → B3–B9 |
 | Onboarding service (atomic)            |   ✅   |        ❌        | Blocked by DB issues → B1–B9 |
