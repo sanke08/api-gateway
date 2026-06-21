@@ -97,7 +97,8 @@ STYLE: Hand-drawn whiteboard diagram in the Excalidraw / Eraser.io aesthetic.
    - [Reverse Proxy](#11-reverse-proxy)
    - [Rate Limiting](#12-rate-limiting)
    - [Retry Transport](#13-retry-transport)
-   - [Request Context](#14-request-context)
+   - [Circuit Breaker](#14-circuit-breaker)
+   - [Request Context](#15-request-context)
 6. [Function Reference](#function-reference)
 7. [Data Model & Relationships](#data-model--relationships)
 8. [User Flows](#user-flows)
@@ -145,6 +146,7 @@ request/response along the way.
 | JWT                | Hand-rolled **HS256** (HMAC-SHA256) via `crypto/hmac`         |
 | Logging            | `log/slog` JSON handler to stdout                             |
 | Architecture       | Clean / layered architecture (handler → service → repository) |
+| Resilience         | Retry transport (exponential backoff + jitter) + Circuit breaker (CLOSED/OPEN/HALF_OPEN state machine) |
 
 > **Note on "zero dependencies":** the original README claimed "zero third-party
 > dependencies." That is *aspirational* — `lib/pq` is a third-party dependency.
@@ -285,7 +287,8 @@ api-gateway/
     │   ├── usage.go                  # Usage (metering record)
     │   ├── upstream.go               # UpstreamTarget (proxy routing config)
     │   ├── transform.go              # Request/ResponseTransform
-    │   └── retry.go                  # RetryPolicy (per-upstream)
+    │   ├── retry.go                  # RetryPolicy (per-upstream)
+    │   └── circuit_breaker.go        # CircuitBreakerPolicy (failure threshold, open duration, probes)
     │
     ├── db/migrations/                # Raw SQL DDL (no migration runner present)
     │   ├── 001_create_tenants.sql    # tenants + updated_at trigger fn
@@ -342,6 +345,10 @@ api-gateway/
     ├── retry/
     │   ├── policy.go                 # Policy + normalizePolicy + backoff/jitter
     │   └── transport.go              # http.RoundTripper that retries safely
+    │
+    ├── circuit_breaker/
+    │   ├── breaker.go                # Breaker state machine (CLOSED/OPEN/HALF_OPEN) + Policy
+    │   └── transport.go              # http.RoundTripper that gates traffic through the breaker
     │
     └── pkg/types/
         ├── path_params.go            # Path-param context helpers
@@ -686,7 +693,9 @@ Hand-drawn Excalidraw style, landscape, tidy tree with no crossing edges.
     logs them, and ignores client cancellations.
   - **`Transport`** — a `retry.Transport` wrapping a cloned
     `http.DefaultTransport` (with `ResponseHeaderTimeout`/`ExpectContinueTimeout`
-    set from `target.Timeout`).
+    set from `target.Timeout`). The circuit breaker transport can be layered
+    between `retry.Transport` and the inner transport to gate traffic before
+    retries even start.
 - **`StaticRegistry`** (`registry.go`) — an in-memory, validated,
   deterministically-ordered `map[tenantID]UpstreamTarget`. `NewStaticRegistry`
   fails fast on missing tenant/base URL or duplicates. Exposes `All()` and
@@ -826,7 +835,88 @@ Hand-drawn Excalidraw style, clear left-to-right timeline, growing gaps.
 
 </details>
 
-### 14. Request Context
+### 14. Circuit Breaker
+
+**`internal/circuit_breaker/`** protects upstream services from repeated failures
+by stopping traffic when a backend is unhealthy.
+
+- **`CircuitBreakerPolicy`** (`models/circuit_breaker.go`) — the public
+  configuration type: `FailureThreshold` (consecutive failures before opening),
+  `OpenDuration` (how long the circuit stays open), `ProbeLimit` (max concurrent
+  probe requests during half-open), `SuccessThreshold` (probes needed to close),
+  `FailureStatusCodes` (HTTP codes that count as failures; default
+  `500/502/503/504`).
+- **State machine** (`State`: `closed` → `open` → `half_open` → `closed`):
+  - **CLOSED** — normal operation; all traffic flows. A success resets the
+    consecutive-failure counter.
+  - **OPEN** — upstream is unhealthy; all requests are rejected immediately
+    with an `OpenError` (carries `RetryAfter`, `Target`). Transitions to
+    `HALF_OPEN` once `OpenDuration` elapses.
+  - **HALF_OPEN** — recovery testing; only `ProbeLimit` concurrent probes are
+    allowed. A probe failure re-opens the circuit; `SuccessThreshold` successful
+    probes close it.
+- **`Breaker`** — the state machine. `New(policy)` validates and normalizes the
+  policy once at startup. `Allow(now)` (lock-free fast path) returns
+  `(allowed bool, retryAfter duration)`. `ReportSuccess(now)` /
+  `ReportFailure(now)` update state based on results. `State()` returns current
+  state for monitoring.
+- **`Transport`** (`transport.go`) — wraps any `http.RoundTripper`. On every
+  `RoundTrip`: calls `Allow` first — if denied returns an `OpenError`;
+  otherwise forwards to the inner transport and calls `ReportFailure` /
+  `ReportSuccess` depending on the outcome and the configured failure status
+  codes. Client cancellations and deadline-exceeded errors do **not** count as
+  failures (`isFailureError` excludes `context.Canceled` /
+  `context.DeadlineExceeded`).
+- **Helpers** — `IsOpenError(err) bool` (for proxy error handler to return
+  `503`), `RetryAfterDuration(err) (duration, ok)` (to set the `Retry-After`
+  header).
+
+The circuit breaker sits at the transport layer, **between** `retry.Transport`
+and the actual upstream — giving it the most granular view of failures.
+
+> The circuit breaker package is fully built and compiles cleanly. Like the retry
+> transport, it is reachable only via the proxy, which is itself not yet wired
+> into `main.go`.
+
+<!-- IMAGE: replace this line with the generated diagram -->
+![Circuit Breaker State Machine](docs/images/14-circuit-breaker.png)
+
+<details>
+<summary><b>🎨 Gemini prompt — Circuit Breaker State Machine</b> (save as <code>docs/images/14-circuit-breaker.png</code>)</summary>
+
+```text
+[PASTE THE SHARED STYLE PREAMBLE FIRST]
+
+DIAGRAM: "Circuit Breaker — CLOSED / OPEN / HALF-OPEN state machine"
+
+Draw a classic state-machine diagram with three large rounded state boxes:
+
+1) GREEN "⚡ CLOSED" (left) — "normal: all traffic flows".
+2) RED "🚫 OPEN" (top-right) — "unhealthy: all requests rejected instantly".
+3) YELLOW "🔍 HALF-OPEN" (bottom-right) — "recovery testing: only ProbeLimit probes allowed".
+
+TRANSITIONS (solid arrows with labels):
+- CLOSED → OPEN: "consecutiveFailures ≥ FailureThreshold  (e.g. 5)"
+- OPEN → HALF-OPEN: "OpenDuration elapsed  (e.g. 10s)"
+- HALF-OPEN → CLOSED: "successfulProbes ≥ SuccessThreshold  AND  no probes in-flight"
+- HALF-OPEN → OPEN: "any probe fails"
+
+Below the state machine draw a small transport flow:
+  Request → breaker.Allow()
+    ├─ OPEN  → OpenError{RetryAfter, Target} (no upstream call)  → HTTP 503
+    └─ CLOSED / HALF-OPEN allowed → next.RoundTrip()
+         ├─ error (net, timeout) → ReportFailure()
+         ├─ status ∈ FailureStatusCodes (500/502/503/504) → ReportFailure()
+         └─ success → ReportSuccess()
+
+Add a small note: "client cancel / deadline exceeded → NOT counted as failure (isFailureError skips context errors)".
+
+Hand-drawn Excalidraw style, clear state boxes, labeled arrows, portrait or square.
+```
+
+</details>
+
+### 15. Request Context
 
 **`internal/pkg/types/`** centralizes typed context keys so identity flows
 through the pipeline without globals:
@@ -891,6 +981,14 @@ A condensed map of the most important exported functions/types by package.
 
 ### `retry`
 - `NewTransport(next http.RoundTripper, policy Policy) (*Transport, error)` → `RoundTrip`.
+
+### `circuit_breaker`
+- `New(policy models.CircuitBreakerPolicy) (*Breaker, error)` — normalize policy + start CLOSED.
+- `(*Breaker).Allow(now time.Time) (bool, time.Duration)` — gate a request; returns `retryAfter` when denied.
+- `(*Breaker).ReportSuccess(now time.Time)` / `ReportFailure(now time.Time)` — feed back result.
+- `(*Breaker).State() State` — read current state (`StateClosed / StateOpen / StateHalfOpen`).
+- `NewTransport(next http.RoundTripper, breaker *Breaker, target string) (*Transport, error)` → `RoundTrip`.
+- `IsOpenError(err) bool`, `RetryAfterDuration(err) (time.Duration, bool)` — helpers for the proxy error handler.
 
 ---
 
@@ -1597,8 +1695,8 @@ Because the mux has **no routes** and nothing else is wired:
 
 - Every request is logged and answered with **`404 page not found`**.
 - The database is **never opened** (`config.NewDatabase` is unused).
-- Repositories, services, handlers, router, proxy, and rate limiter are
-  **compiled but never instantiated** at runtime.
+- Repositories, services, handlers, router, proxy, rate limiter, and circuit
+  breaker are **compiled but never instantiated** at runtime.
 
 In other words: **the building blocks are written and individually coherent, but
 the application is not assembled.** Wiring it together (in `server.New` or a new
@@ -1632,7 +1730,7 @@ runtime)". Draw these as a loose grid of DASHED-outline gray boxes, each with a
   "Repositories ×5", "Onboarding / Auth / APIKeyAuth / TenantResolution
   services", "JWTManager", "APIKeyAuth & TenantResolution middleware",
   "Handlers (/onboard, /login)", "Proxy + StaticRegistry", "RateLimiter",
-  "RetryTransport".
+  "RetryTransport", "CircuitBreakerTransport".
   Caption under the grid: "All compile; go vet is clean; none are referenced by
   main.go."
 
@@ -1765,6 +1863,7 @@ The **Notes** column links each area to the relevant [TODO.md](TODO.md) item(s).
 | Reverse proxy (per-tenant)             |   ✅   |        ❌        | No registry → R1, R3 |
 | Request/response transforms            |   ✅   |        ❌        | Headers + path only (no body) |
 | Retry transport (backoff+jitter)       |   ✅   |     ⚠️ via proxy  | Reachable only via proxy; cleanup → C4 |
+| Circuit breaker (CLOSED/OPEN/HALF_OPEN)|   ✅   |     ⚠️ via proxy  | Transport layer; not wired end-to-end yet → R1 |
 | Rate limiting (token bucket)           |   ✅   |        ❌        | In-memory; not routed → R1 |
 | Usage metering                         |   ⚠️   |        ❌        | Model+repo exist; no writer → B4, R4 |
 | Refresh-token endpoint                 |   ❌   |        ❌        | Service exists; no handler → R5 |

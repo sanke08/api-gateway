@@ -20,7 +20,7 @@ as you complete them. Full context for each item is in
 | 🟢 P2 — Build-out / roadmap              |  0   |   8   |
 | **TOTAL**                               |  **0** | **23** |
 
-_Last updated: 2026-06-14_
+_Last updated: 2026-06-21_
 
 ---
 
@@ -113,7 +113,8 @@ _Last updated: 2026-06-14_
 
 - [ ] **R1 — Wire the data plane.** Build a `proxy.StaticRegistry` of
   `UpstreamTarget`s; chain `APIKeyAuth` / `TenantResolution` → `ratelimit` →
-  `proxy.Handler` on proxied routes.
+  `proxy.Handler` on proxied routes. Wire `circuitbreaker.Transport` (per
+  upstream) and `retry.Transport` as the proxy's transport stack.
 - [ ] **R2 — Move secrets/policies into config.** JWT secret/issuer/TTLs,
   rate-limit rules, upstream definitions → env or config file/DB.
   - File: [internal/config/config.go](internal/config/config.go)
@@ -154,6 +155,7 @@ Components that are **built and individually coherent** today (compile clean,
 | Reverse proxy (per-tenant) | ⚠️ Built | No registry populated (R1/R3) |
 | Request/response transforms | ⚠️ Built | Headers + path only (no body) |
 | Retry transport (backoff+jitter) | ⚠️ Built | Reachable only via the proxy |
+| Circuit breaker (CLOSED/OPEN/HALF_OPEN + Transport) | ⚠️ Built | Transport layer implemented; not wired end-to-end yet (R1) |
 | Rate limiter (token bucket) | ⚠️ Built | In-memory; not routed (R1) |
 
 > ✅ Done = complete as intended · ⚠️ Built = code exists & compiles but is not
