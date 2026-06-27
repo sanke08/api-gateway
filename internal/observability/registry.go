@@ -401,7 +401,7 @@ func NewRegistry() *Registry {
 // Why this helper exists:
 // Most metrics increase one event at a time, so callers should not have
 // to write AddCounter(..., 1) everywhere.
-func (r *Registry) incCounter(name string, labels Labels) {
+func (r *Registry) IncCounter(name string, labels Labels) {
 	r.addCounter(name, labels, 1)
 }
 
@@ -698,7 +698,7 @@ func (r *Registry) ObserveDuration(name string, labels Labels, d time.Duration) 
 //
 //	16 KB served
 func (r *Registry) RecordRequest(labels Labels, duration time.Duration, responseBytes int64) {
-	r.incCounter("gateway_requests_total", labels)
+	r.IncCounter("gateway_requests_total", labels)
 	r.ObserveDuration("gateway_request_duration_seconds", labels, duration)
 	r.addCounter("gateway_response_bytes_total", labels, responseBytes)
 }
@@ -746,7 +746,7 @@ func (r *Registry) RecordRequest(labels Labels, duration time.Duration, response
 //
 // Every error increments the counter by 1.
 func (r *Registry) RecordError(labels Labels) {
-	r.incCounter("gateway_request_errors_total", labels)
+	r.IncCounter("gateway_request_errors_total", labels)
 }
 
 // RecordCacheHit records a cache hit.
@@ -787,12 +787,12 @@ func (r *Registry) RecordError(labels Labels) {
 // - fewer upstream requests
 // - less infrastructure cost
 func (r *Registry) RecordCacheHit(labels Labels) {
-	r.incCounter("gateway_cache_hits_total", labels)
+	r.IncCounter("gateway_cache_hits_total", labels)
 }
 
 // RecordCacheMiss records a cache miss.
 func (r *Registry) RecordCacheMiss(labels Labels) {
-	r.incCounter("gateway_cache_misses_total", labels)
+	r.IncCounter("gateway_cache_misses_total", labels)
 }
 
 // RecordRetry records one retry attempt.
@@ -832,7 +832,7 @@ func (r *Registry) RecordCacheMiss(labels Labels) {
 // - network issues
 // - overloaded services
 func (r *Registry) RecordRetry(labels Labels) {
-	r.incCounter("gateway_retries_total", labels)
+	r.IncCounter("gateway_retries_total", labels)
 }
 
 // RecordBreakerOpen records that a circuit breaker is open.

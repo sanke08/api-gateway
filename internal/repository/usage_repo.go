@@ -35,33 +35,85 @@ func (r *postgresUsageRepo) Log(ctx context.Context, record models.Usage) (model
 	}
 
 	const q = `
-		INSERT INTO "usage" (tenant_id, api_key_id, path, method, "timestamp", bytes_in, bytes_out)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		RETURNING id, tenant_id, api_key_id, path, method, "timestamp", bytes_in, bytes_out
+		INSERT INTO "usage" (
+			request_id,
+			tenant_id,
+			api_key_id,
+			user_id,
+			membership_id,
+			path,
+			method,
+			status_code,
+			duration_ms,
+			"timestamp",
+			bytes_in,
+			bytes_out,
+			cached,
+			retried
+		)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+		RETURNING
+			id,
+			request_id,
+			tenant_id,
+			api_key_id,
+			user_id,
+			membership_id,
+			path,
+			method,
+			status_code,
+			duration_ms,
+			"timestamp",
+			bytes_in,
+			bytes_out,
+			cached,
+			retried
 	`
 
 	var out models.Usage
+	var apiKeyID sql.NullString
+	var userID sql.NullString
+	var membershipID sql.NullString
+
 	err := r.db.QueryRowContext(ctx, q,
+		nullString(record.RequestID),
 		record.TenantID,
-		record.APIKeyID,
-		record.Endpoint,
+		stringPtrToNull(record.APIKeyID),
+		stringPtrToNull(record.UserID),
+		stringPtrToNull(record.MembershipID),
+		record.Path,
 		record.Method,
+		record.StatusCode,
+		record.DurationMS,
 		record.Timestamp,
 		record.BytesIn,
 		record.BytesOut,
+		record.Cached,
+		record.Retried,
 	).Scan(
 		&out.ID,
+		&out.RequestID,
 		&out.TenantID,
-		&out.APIKeyID,
-		&out.Endpoint,
+		&apiKeyID,
+		&userID,
+		&membershipID,
+		&out.Path,
 		&out.Method,
+		&out.StatusCode,
+		&out.DurationMS,
 		&out.Timestamp,
 		&out.BytesIn,
 		&out.BytesOut,
+		&out.Cached,
+		&out.Retried,
 	)
 	if err != nil {
-		return models.Usage{}, classifySQLError(op, "usage", err, true)
+		return models.Usage{}, classifySQLError(op, "usage", err, false)
 	}
+
+	out.APIKeyID = nullStringPtrFromNull(apiKeyID)
+	out.UserID = nullStringPtrFromNull(userID)
+	out.MembershipID = nullStringPtrFromNull(membershipID)
 
 	return out, nil
 }
@@ -95,7 +147,7 @@ func (r *postgresUsageRepo) ListByTenant(ctx context.Context, tenantID string) (
 			&item.ID,
 			&item.TenantID,
 			&item.APIKeyID,
-			&item.Endpoint,
+			&item.Path,
 			&item.Method,
 			&item.Timestamp,
 			&item.BytesIn,
@@ -111,4 +163,29 @@ func (r *postgresUsageRepo) ListByTenant(ctx context.Context, tenantID string) (
 	}
 
 	return out, nil
+}
+
+func nullString(v string) interface{} {
+	if v == "" {
+		return nil
+	}
+	return v
+}
+
+// func nullStringPtr(v *string) interface{} {
+// 	if v == nil {
+// 		return nil
+// 	}
+// 	if *v == "" {
+// 		return nil
+// 	}
+// 	return *v
+// }
+
+func nullStringPtrFromNull(v sql.NullString) *string {
+	if !v.Valid {
+		return nil
+	}
+	s := v.String
+	return &s
 }

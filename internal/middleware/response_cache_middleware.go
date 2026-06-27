@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sanke08/api_gateway/internal/cache"
+	"github.com/sanke08/api_gateway/internal/observability"
 	requesttypes "github.com/sanke08/api_gateway/internal/pkg/types"
 )
 
@@ -262,7 +263,9 @@ func NewResponseCacheMiddleware(store cache.Store, policy ResponseCachePolicy) (
 			if err != nil {
 				return
 			}
-
+			if trace, ok := observability.TraceFromContext(r.Context()); ok && trace != nil {
+				trace.Cached = true
+			}
 			mw.store.Set(r.Context(), key, data, mw.policy.ttl)
 		})
 	}, nil

@@ -172,6 +172,21 @@ type Trace struct {
 	//
 	// Can help identify unusually large responses.
 	BytesWritten int64
+
+	// UserID is the resolved human user, if available.
+	UserID string
+
+	// APIKeyID is the resolved API key, if available.
+	APIKeyID string
+
+	// MembershipID is the resolved tenant membership, if available.
+	MembershipID string
+
+	// Cached reports whether the request was served from cache.
+	Cached bool
+
+	// Retried reports whether the upstream call needed retry behavior.
+	Retried bool
 }
 
 // traceContextKey is a private context key.

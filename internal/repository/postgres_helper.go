@@ -71,6 +71,12 @@ func nullStringPtr(ns sql.NullString) *string {
 	v := ns.String
 	return &v
 }
+func stringPtrToNull(v *string) any {
+	if v == nil || *v == "" {
+		return nil
+	}
+	return *v
+}
 
 func nullTimePtr(nt sql.NullTime) *time.Time {
 	if !nt.Valid {
@@ -199,25 +205,43 @@ func normalizeAPIKeyForCreate(key models.APIKey) (models.APIKey, error) {
 func validateUsageRecordForCreate(record models.Usage) error {
 	const op = "usage.log"
 
+	record.APIKeyID = trimStringPtr(record.APIKeyID)
+	record.UserID = trimStringPtr(record.UserID)
+	record.MembershipID = trimStringPtr(record.MembershipID)
 	record.TenantID = trimString(record.TenantID)
-	record.APIKeyID = trimString(record.APIKeyID)
-	record.Endpoint = trimString(record.Endpoint)
+	record.RequestID = trimString(record.RequestID)
+	record.Path = trimString(record.Path)
 	record.Method = trimString(record.Method)
 
+	if record.APIKeyID == nil && record.UserID == nil && record.MembershipID == nil {
+		return validationError(op, "usage", "one of api_key_id, user_id, or membership_id is required")
+	}
+	if record.RequestID == "" {
+		return validationError(op, "usage", "request_id is required")
+	}
 	if record.TenantID == "" {
 		return validationError(op, "usage", "tenant_id is required")
 	}
-	if record.APIKeyID == "" {
-		return validationError(op, "usage", "api_key_id is required")
-	}
-	if record.Endpoint == "" {
-		return validationError(op, "usage", "Endpoint is required")
+	if record.Path == "" {
+		return validationError(op, "usage", "Path is required")
 	}
 	if record.Method == "" {
 		return validationError(op, "usage", "method is required")
 	}
 	if record.Timestamp.IsZero() {
 		return validationError(op, "usage", "timestamp is required")
+	}
+	if record.StatusCode < 100 || record.StatusCode > 599 {
+		return validationError(op, "usage", "invalid status code")
+	}
+	if record.DurationMS < 0 {
+		return validationError(op, "usage", "duration_ms must be non-negative")
+	}
+	if record.BytesIn < 0 {
+		return validationError(op, "usage", "bytes_in must be non-negative")
+	}
+	if record.BytesOut < 0 {
+		return validationError(op, "usage", "bytes_out must be non-negative")
 	}
 
 	return nil

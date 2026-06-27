@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/sanke08/api_gateway/internal/observability"
 	requestTypes "github.com/sanke08/api_gateway/internal/pkg/types"
 	"github.com/sanke08/api_gateway/internal/services"
 )
@@ -66,6 +67,11 @@ func (m *TenantResolutionMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Re
 	if err != nil {
 		m.writeError(w, err)
 		return
+	}
+	if trace, ok := observability.TraceFromContext(r.Context()); ok && trace != nil {
+		trace.TenantID = result.Tenant.Id
+		trace.UserID = result.User.Id
+		trace.MembershipID = result.Membership.ID
 	}
 
 	ctx := r.Context()

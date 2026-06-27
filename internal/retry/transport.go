@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"sync"
+
+	"github.com/sanke08/api_gateway/internal/observability"
 )
 
 // The complete real production example:
@@ -309,6 +311,9 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 			delay := nextBackoff(t.set.delay, t.set.maxDelay, t.set.jitter, attempt, t.random)
 			if err := waitWithContext(req.Context(), delay); err != nil {
+				if trace, ok := observability.TraceFromContext(req.Context()); ok && trace != nil {
+					trace.Retried = true
+				}
 				return nil, err
 			}
 
@@ -321,6 +326,9 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		delay := nextBackoff(t.set.delay, t.set.maxDelay, t.set.jitter, attempt, t.random)
 		if err := waitWithContext(req.Context(), delay); err != nil {
+			if trace, ok := observability.TraceFromContext(req.Context()); ok && trace != nil {
+				trace.Retried = true
+			}
 			return nil, err
 		}
 	}

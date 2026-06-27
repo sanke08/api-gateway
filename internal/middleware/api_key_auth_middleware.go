@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/sanke08/api_gateway/internal/observability"
 	requestTypes "github.com/sanke08/api_gateway/internal/pkg/types"
 	"github.com/sanke08/api_gateway/internal/services"
 )
@@ -55,6 +56,10 @@ func (m *APIKeyAuthMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		m.writeError(w, err)
 		return
+	}
+	if trace, ok := observability.TraceFromContext(r.Context()); ok && trace != nil {
+		trace.TenantID = result.Tenant.Id
+		trace.APIKeyID = result.APIKey.ID
 	}
 
 	ctx := r.Context()
