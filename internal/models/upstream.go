@@ -282,4 +282,13 @@ type UpstreamTarget struct {
 	// - troubleshooting
 	// - rollback analysis
 	UpdatedAt time.Time
+
+	// HealthPath is the path used by readiness probes to check upstream health.
+	//
+	// Example:
+	//   "/health"
+	//
+	// Why this exists:
+	// Different backends may expose different health endpoints.
+	HealthPath string
 }
