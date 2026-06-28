@@ -33,7 +33,7 @@ func (r *PostgresUserRepo) Create(ctx context.Context, user models.User) (models
 	query := `
 		INSERT INTO users (email, password_hash)
 		VALUES ($1, $2)
-		RETURNING id
+		RETURNING id, email, password_hash, created_at, updated_at
 	`
 
 	err = r.db.QueryRowContext(

@@ -35,8 +35,9 @@ CREATE TABLE IF NOT EXISTS usage (
     -- Unique request identifier.
     request_id TEXT,
 
-    -- Endpoint that was accessed.
-    endpoint TEXT NOT NULL,
+    -- Request path/endpoint that was accessed.
+    -- Named "path" to match the repository SQL and the Usage.Path model field.
+    path TEXT NOT NULL,
 
     -- HTTP method (GET, POST, etc.).
     method TEXT NOT NULL,
@@ -59,6 +60,10 @@ CREATE TABLE IF NOT EXISTS usage (
     -- Whether the gateway retried the upstream request.
     retried BOOLEAN NOT NULL DEFAULT FALSE,
 
+    -- Application-set event time for the request (set by the gateway, not the DB).
+    -- The repository writes this column explicitly as "timestamp".
+    "timestamp" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
     -- Creation timestamp.
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
@@ -73,8 +78,9 @@ CREATE INDEX IF NOT EXISTS idx_usage_tenant_api_time
 CREATE INDEX IF NOT EXISTS idx_usage_tenant_time
     ON usage (tenant_id, created_at DESC);
 
+-- Matches ListByTenant's "ORDER BY tenant_id, \"timestamp\" DESC".
 CREATE INDEX IF NOT EXISTS idx_usage_tenant_timestamp
-    ON usage (tenant_id, created_at DESC);
+    ON usage (tenant_id, "timestamp" DESC);
 
 CREATE INDEX IF NOT EXISTS idx_usage_request_id
     ON usage (request_id);

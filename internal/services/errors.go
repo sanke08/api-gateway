@@ -172,7 +172,10 @@ func mapRepositoryError(op string, err error) error {
 			return &ServiceError{Kind: ErrValidation.Kind, Op: op, Err: repoErr}
 		case ErrConflict.Kind:
 			return &ServiceError{Kind: ErrConflict.Kind, Op: op, Err: repoErr}
-		case ErrValidation.Kind:
+		case repository.ErrNotFound.Kind:
+			// A missing referenced row (e.g. unknown tenant/user) is treated as a
+			// validation failure at the service layer: the caller supplied input
+			// that does not resolve to an existing entity.
 			return &ServiceError{Kind: ErrValidation.Kind, Op: op, Err: repoErr}
 		default:
 			return &ServiceError{Kind: ErrInternal.Kind, Op: op, Err: repoErr}

@@ -16,7 +16,7 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 --   - id: A globally unique identifier for the tenant.
 --   - name: Human-readable name of the tenant.
 --   - Slug: A unique Slug associated with the tenant, used for routing/identification.
---   - status: The current status of the tenant (active/inactive).
+--   - status: The current status of the tenant (active/suspended).
 --
 -- Relationships:
 --   - One-to-Many with TenantMembership: A tenant has many members (users).
@@ -27,10 +27,10 @@ CREATE TABLE IF NOT EXISTS tenants (
 	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 	name VARCHAR(60) NOT NULL,
 	Slug VARCHAR(100) NOT NULL UNIQUE,
-	status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'inactive')),
-	
+	status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'suspended')),
+
 	created_at TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
-	updated_at TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
+	updated_at TIMESTAMP  DEFAULT CURRENT_TIMESTAMP
 );
 
 

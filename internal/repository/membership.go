@@ -38,7 +38,7 @@ func (r *postgresTenantMembershipRepo) Create(ctx context.Context, membership mo
 	const q = `
 		INSERT INTO tenant_memberships (user_id, tenant_id, role, status)
 		VALUES ($1, $2, $3, $4)
-		RETURNING id, user_id, tenant_id, role, status
+		RETURNING id, user_id, tenant_id, role, status, created_at, updated_at
 	`
 
 	var out models.TenantMembership
@@ -46,7 +46,6 @@ func (r *postgresTenantMembershipRepo) Create(ctx context.Context, membership mo
 	var status string
 
 	err = r.db.QueryRowContext(ctx, q,
-		normalized.ID,
 		normalized.UserId,
 		normalized.TenantId,
 		string(normalized.Role),
@@ -79,7 +78,7 @@ func (r *postgresTenantMembershipRepo) GetByID(ctx context.Context, id string) (
 	}
 
 	const q = `
-		SELECT id, user_id, tenant_id, role, status
+		SELECT id, user_id, tenant_id, role, status, created_at, updated_at
 		FROM tenant_memberships
 		WHERE id = $1
 	`
@@ -121,7 +120,7 @@ func (r *postgresTenantMembershipRepo) GetByUserAndTenant(ctx context.Context, u
 	}
 
 	const q = `
-		SELECT id, user_id, tenant_id, role, status
+		SELECT id, user_id, tenant_id, role, status, created_at, updated_at
 		FROM tenant_memberships
 		WHERE user_id = $1 AND tenant_id = $2
 	`
@@ -158,7 +157,7 @@ func (r *postgresTenantMembershipRepo) ListByUser(ctx context.Context, userID st
 	}
 
 	const q = `
-		SELECT id, user_id, tenant_id, role, status
+		SELECT id, user_id, tenant_id, role, status, created_at, updated_at
 		FROM tenant_memberships
 		WHERE user_id = $1
 		ORDER BY created_at ASC, id ASC
@@ -210,7 +209,7 @@ func (r *postgresTenantMembershipRepo) ListByTenant(ctx context.Context, tenantI
 	}
 
 	const q = `
-		SELECT id, user_id, tenant_id, role, status
+		SELECT id, user_id, tenant_id, role, status, created_at, updated_at
 		FROM tenant_memberships
 		WHERE tenant_id = $1
 		ORDER BY created_at ASC, id ASC

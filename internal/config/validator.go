@@ -28,5 +28,12 @@ func Validate(cfg *Config) error {
 		return errors.New("max open connections is required")
 	}
 
+	// JWT_SECRET must be at least 32 bytes; shorter secrets are trivially
+	// brute-forceable against HMAC-SHA256.
+	if len(cfg.JWT.Secret) < 32 {
+		observability.Error("JWT_SECRET must be at least 32 characters")
+		return errors.New("JWT_SECRET must be at least 32 characters")
+	}
+
 	return nil
 }

@@ -31,8 +31,8 @@ func (r *PostgresTenantRepo) Create(ctx context.Context, tenant models.Tenant) (
 	}
 
 	const q = `
-		INSERT INTO tenants (id, name, slug, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO tenants (name, slug, status)
+		VALUES ($1, $2, $3)
 		RETURNING id, name, slug, status, created_at, updated_at
 	`
 
@@ -40,12 +40,9 @@ func (r *PostgresTenantRepo) Create(ctx context.Context, tenant models.Tenant) (
 	var status string
 
 	err = r.db.QueryRowContext(ctx, q,
-		normalized.Id,
 		normalized.Name,
 		normalized.Slug,
 		string(normalized.Status),
-		normalized.CreatedAt,
-		normalized.UpdatedAt,
 	).Scan(
 		&out.Id,
 		&out.Name,

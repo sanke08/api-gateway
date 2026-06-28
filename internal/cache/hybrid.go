@@ -114,3 +114,17 @@ func (h *HybridStore) Delete(ctx context.Context, key string) {
 		h.local.Delete(ctx, key)
 	}
 }
+
+// PruneExpired removes expired entries from the local memory store.
+//
+// Why only local:
+// The remote cache service manages its own TTL-based expiry — we have no
+// API to trigger pruning there. The local MemoryStore is in-process and
+// accumulates expired entries until explicitly pruned. Calling this on a
+// ticker (e.g. every 5 minutes) keeps memory bounded.
+func (h *HybridStore) PruneExpired() int {
+	if h.local == nil {
+		return 0
+	}
+	return h.local.PruneExpired()
+}

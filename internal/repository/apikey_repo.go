@@ -38,7 +38,7 @@ func (r *postgresAPIKeyRepo) Create(ctx context.Context, key models.APIKey) (mod
 	const q = `
 		INSERT INTO api_keys (tenant_id, key_hash, description, active)
 		VALUES ($1, $2, $3, $4)
-		RETURNING id, tenant_id, key_hash, description, active, created_at, expires_at, updated_at
+		RETURNING id, tenant_id, key_hash, description, active, created_at, updated_at
 	`
 
 	var out models.APIKey
@@ -75,7 +75,7 @@ func (r *postgresAPIKeyRepo) GetByID(ctx context.Context, id string) (models.API
 	}
 
 	const q = `
-		SELECT id, tenant_id, key_hash, description, active, created_at, expires_at, updated_at
+		SELECT id, tenant_id, key_hash, description, active, created_at, updated_at
 		FROM api_keys
 		WHERE id = $1
 	`
@@ -108,7 +108,7 @@ func (r *postgresAPIKeyRepo) GetByHash(ctx context.Context, hash string) (models
 	}
 
 	const q = `
-		SELECT id, tenant_id, key_hash, description, active, created_at, expires_at, updated_at
+		SELECT id, tenant_id, key_hash, description, active, created_at, updated_at
 		FROM api_keys
 		WHERE key_hash = $1
 	`
@@ -141,7 +141,7 @@ func (r *postgresAPIKeyRepo) ListByTenant(ctx context.Context, tenantID string) 
 	}
 
 	const q = `
-		SELECT id, tenant_id, key_hash, description, active, created_at, expires_at, updated_at
+		SELECT id, tenant_id, key_hash, description, active, created_at, updated_at
 		FROM api_keys
 		WHERE tenant_id = $1
 		ORDER BY created_at ASC, id ASC
