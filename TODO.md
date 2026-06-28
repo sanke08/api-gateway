@@ -17,10 +17,19 @@ as you complete them. Full context for each item is in
 | --------------------------------------- | :--: | :---: |
 | 🔴 P0 — Blocking (app cannot run)        |  0   |   9   |
 | 🟡 P1 — Correctness / cleanliness        |  0   |   6   |
-| 🟢 P2 — Build-out / roadmap              |  0   |  10   |
-| **TOTAL**                               |  **0** | **25** |
+| 🟢 P2 — Build-out / roadmap              |  0   |  14   |
+| **TOTAL**                               |  **0** | **29** |
 
-_Last updated: 2026-06-21 (added observability subsystem)_
+_Last updated: 2026-06-28 (added health checks, async usage tracking, graceful
+shutdown, and edge/CORS middleware — all built, none wired; verified that **no
+P0/P1 items have been fixed yet** — code still builds & `go vet`-clean because
+the SQL bugs live in query strings, not compiled code)._
+
+> **Verification note (2026-06-28):** `go build ./...` and `go vet ./...` both
+> pass with exit 0, and there are still **0 `_test.go` files**. The blocking
+> bugs B1–B9 and cleanups C1–C6 are **all still open** — a clean build does not
+> mean the queries run. Four new subsystems landed since this list was first
+> written (see **R11–R14** and the new rows in [What's Complete](#-whats-complete-done)).
 
 ---
 
@@ -188,6 +197,50 @@ _Last updated: 2026-06-21 (added observability subsystem)_
     [internal/middleware/tenant_resolution_middleware.go](internal/middleware/tenant_resolution_middleware.go),
     [internal/middleware/response_cache_middleware.go](internal/middleware/response_cache_middleware.go)
   - ⛓️ Depends on: B1 (app must be assembled first).
+- [ ] **R11 — Wire graceful shutdown.** `ShutdownManager` + `GracefulServer`
+  exist but `main.go` still uses `server.New` (bare mux) and calls
+  `srv.Start()` with no signal handling. Switch the bootstrap to build a
+  `GracefulServer`, wrap the handler with `ShutdownManager.Wrap`, listen for
+  `SIGINT`/`SIGTERM`, and call `Shutdown(ctx)` with a timeout. Register every
+  background worker (R12 usage tracker, R9 cache pruner, R7 limiter pruner) via
+  `RegisterHook` so they drain on exit.
+  - Files: [internal/cmd/gateway/main.go](internal/cmd/gateway/main.go),
+    [internal/server/shutdown.go](internal/server/shutdown.go),
+    [internal/server/server.go](internal/server/server.go)
+  - ⛓️ Depends on: B1.
+- [ ] **R12 — Wire async usage tracking.** `AsyncUsageTracker`
+  (`services/usage.go`) + `UsageMiddleware` (`middleware/usage_middleware.go`)
+  are built but never constructed. In the bootstrap: construct
+  `NewAsyncUsageTracker(repos.Usage, bufferSize, logger, reg)`, wrap proxied
+  routes with `NewUsageMiddleware(tracker)`, and register `tracker.Close` as a
+  shutdown hook (R11). This is the concrete implementation of the old **R4**
+  ("write usage rows from the proxy path") — R4 stays as the umbrella goal.
+  - Files: [internal/services/usage.go](internal/services/usage.go),
+    [internal/middleware/usage_middleware.go](internal/middleware/usage_middleware.go),
+    [internal/cmd/gateway/main.go](internal/cmd/gateway/main.go)
+  - ⛓️ Depends on: B1, B4 (usage repo SQL must match the table first), R11.
+- [ ] **R13 — Wire health & readiness endpoints.** `HealthChecker`
+  (`services/health.go`), the `/health` + `/ready` handlers
+  (`handlers/health_handlers.go`), and the health models are built but never
+  instantiated or routed. Construct `NewHealthChecker(db, reg)`, register
+  `GET /health` (liveness) and `GET /ready` (readiness — pings DB + probes
+  upstreams) on the router. Readiness should flip to 503 once R11 shutdown
+  begins.
+  - Files: [internal/services/health.go](internal/services/health.go),
+    [internal/handlers/health_handlers.go](internal/handlers/health_handlers.go),
+    [internal/models/health.go](internal/models/health.go),
+    [internal/cmd/gateway/main.go](internal/cmd/gateway/main.go)
+  - ⛓️ Depends on: B1, C5 (`db.Ping` makes the DB probe meaningful).
+- [ ] **R14 — Wire edge (CORS + security headers) middleware.** `EdgePolicy` /
+  `NewEdgeMiddleware` (`middleware/edge.go`) build CORS + security-header
+  handling but are never applied. Move the policy into config (allowed origins,
+  HSTS, CSP, frame options), construct the middleware, and add it as a global
+  `router.Use(...)` so it runs on every route (it handles `OPTIONS` preflight
+  itself).
+  - Files: [internal/middleware/edge.go](internal/middleware/edge.go),
+    [internal/config/config.go](internal/config/config.go),
+    [internal/cmd/gateway/main.go](internal/cmd/gateway/main.go)
+  - ⛓️ Depends on: B1, R2 (policy belongs in config).
 
 ---
 
@@ -224,6 +277,11 @@ Components that are **built and individually coherent** today (compile clean,
 | Observability middleware (`observability/middleware.go`) | ⚠️ Built | Records timing+bytes+status per request; not wired to router (R10) |
 | Cache observability helpers (`observability/helper.go`) | ⚠️ Built | `RecordCacheHit/Miss`; cache middleware doesn't call them yet (R10) |
 | Rate limiter (token bucket) | ⚠️ Built | In-memory; not routed (R1) |
+| Graceful shutdown (`server/shutdown.go`: `ShutdownManager`, `GracefulServer`) | ⚠️ Built | `Wrap` + `RegisterHook` + 3-phase `Shutdown`; `main.go` still calls bare `srv.Start()` (R11) |
+| Async usage tracking (`services/usage.go` `AsyncUsageTracker` + `middleware/usage_middleware.go`) | ⚠️ Built | Buffered queue + background writer + `Close` drain + metrics; never constructed (R12, R4) |
+| Health checker (`services/health.go`) | ⚠️ Built | Liveness + readiness (DB ping + upstream probes); `NewHealthChecker` never called (R13) |
+| Health endpoints (`handlers/health_handlers.go`, `models/health.go`) | ⚠️ Built | `GET /health` + `GET /ready` handlers + response models; not routed (R13) |
+| Edge middleware (`middleware/edge.go`: `EdgePolicy`, CORS + security headers) | ⚠️ Built | CORS preflight + `X-Frame-Options`/HSTS/CSP/etc.; `NewEdgeMiddleware` never applied (R14) |
 
 > ✅ Done = complete as intended · ⚠️ Built = code exists & compiles but is not
 > wired/runnable yet.
@@ -239,6 +297,10 @@ Components that are **built and individually coherent** today (compile clean,
 - Response cache middleware registration on proxied routes → **R9**
 - `NewRegistry()` + `observability.Middleware` + `/metrics` endpoint → **R10** (packages built; wiring not started)
 - `RecordRetry`, `RecordBreakerOpen/Closed`, `RecordCacheHit/Miss` wired into transports/middleware → **R10**
+- Graceful shutdown wiring: `GracefulServer` + signal handling + `RegisterHook` → **R11** (packages built; `main.go` not switched over)
+- Async usage tracker + usage middleware instantiation on proxied routes → **R12** (concrete form of **R4**)
+- Health/readiness endpoints (`HealthChecker` + `/health` + `/ready`) routing → **R13**
+- Edge CORS + security-header middleware applied globally → **R14**
 
 ---
 
@@ -251,9 +313,11 @@ B4 ─┼─► (fix schema)  ─► B6 ─┐
 B5 ─┘                        ├─► (repos work) ─► B1 (wire /onboard, /login)
                   B7 ─ B8 ─ B9 ┘                        │
                                                         ▼
-                                  C1 C2 C3 C5 (cleanups)  ─► R1 (data plane) ─► R9 (cache) ─► R10 (observability)
-                                                              │
-                                                R2 R3 R4 R5 … ┘  ─► C6 (tests throughout)
+              C1 C2 C3 C5 (cleanups) ─► R1 (data plane) ─► R9 (cache) ─► R10 (observability)
+                                            │
+                                            ├─► R11 (graceful shutdown) ─► R12 (usage tracking) / R13 (health)
+                                            │
+                          R2 R3 R4 R5 R14 … ┘  ─► C6 (tests throughout)
 ```
 
 Fix the schema + repo bugs first (B2–B9) so the DB actually works, **then** wire

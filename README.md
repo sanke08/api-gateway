@@ -25,7 +25,11 @@ hand-rolled on top of `crypto/*`.
 >
 > 📋 **A complete, prioritized checklist of every fix and build-out task lives in
 > [TODO.md](TODO.md)** — work through it one item at a time (B1–B9 blocking,
-> C1–C6 cleanups, R1–R8 roadmap). It also tracks **what's done vs. remaining**.
+> C1–C6 cleanups, R1–R14 roadmap). It also tracks **what's done vs. remaining**.
+> As of 2026-06-28 the project still **builds and `go vet`s cleanly with 0
+> tests**, and **none** of B1–B9 / C1–C6 have been fixed — four more subsystems
+> (graceful shutdown, async usage tracking, health checks, edge/CORS middleware)
+> have been *built* but, like everything else, are not yet wired in.
 
 ---
 
@@ -103,6 +107,7 @@ STYLE: Hand-drawn whiteboard diagram in the Excalidraw / Eraser.io aesthetic.
      - [Response Cache (ResponseCacheMiddleware)](#response-cache-responsecachemiddleware)
    - [Middleware — Response Cache](#9-middleware) (see §9)
    - [Request Context](#16-request-context)
+   - [Operational Subsystems](#17-operational-subsystems-built-not-yet-wired) (Shutdown · Async Usage · Health · Edge/CORS)
 6. [Function Reference](#function-reference)
 7. [Data Model & Relationships](#data-model--relationships)
 8. [User Flows](#user-flows)
@@ -300,7 +305,8 @@ api-gateway/
     │   ├── upstream.go               # UpstreamTarget (proxy routing config)
     │   ├── transform.go              # Request/ResponseTransform
     │   ├── retry.go                  # RetryPolicy (per-upstream)
-    │   └── circuit_breaker.go        # CircuitBreakerPolicy (failure threshold, open duration, probes)
+    │   ├── circuit_breaker.go        # CircuitBreakerPolicy (failure threshold, open duration, probes)
+    │   └── health.go                 # Liveness/Readiness/Database/Upstream status structs
     │
     ├── db/migrations/                # Raw SQL DDL (no migration runner present)
     │   ├── 001_create_tenants.sql    # tenants + updated_at trigger fn
@@ -326,6 +332,8 @@ api-gateway/
     │   ├── api_key_auth.go           # APIKeyAuthenticator (machine auth)
     │   ├── onboarding.go             # OnboardingService (atomic tenant create)
     │   ├── tenant_resolution.go      # TenantResolver (token+tenant+membership)
+    │   ├── usage.go                  # AsyncUsageTracker (queue + background writer)
+    │   ├── health.go                 # HealthChecker (liveness/readiness probes)
     │   ├── errors.go                 # ServiceError + mapRepositoryError
     │   ├── auth_errors.go            # ErrUnauthorized helper
     │   └── authorization_errors.go   # ErrForbidden helper
@@ -333,16 +341,20 @@ api-gateway/
     ├── handlers/                     # Thin HTTP adapters
     │   ├── auth_handler.go           # POST /login
     │   ├── onboarding_handlers.go    # POST /onboard
+    │   ├── health_handlers.go        # GET /health, GET /ready
     │   └── json.go                   # writeJSON / writeJSONError
     │
     ├── middleware/
     │   ├── logging.go                        # LoggingMiddleware (+ request ID)
     │   ├── api_key_auth_middleware.go         # X-API-Key → tenant in context
     │   ├── tenant_resolution_middleware.go    # Bearer + X-Tenant-ID → context
-    │   └── response_cache_middleware.go       # ResponseCacheMiddleware (tee writer, policy, key builder)
+    │   ├── response_cache_middleware.go       # ResponseCacheMiddleware (tee writer, policy, key builder)
+    │   ├── usage_middleware.go                # UsageMiddleware (tee → Enqueue usage record)
+    │   └── edge.go                            # EdgeMiddleware (CORS preflight + security headers)
     │
     ├── server/
     │   ├── server.go                 # http.Server wrapper (Start)
+    │   ├── shutdown.go               # ShutdownManager + GracefulServer (graceful exit)
     │   └── router.go                 # Trie router (control/data plane split)
     │
     ├── proxy/
@@ -1704,6 +1716,52 @@ through the pipeline without globals:
 - **`path_params.go`** — `WithPathParams`, `PathParamsFromContext`, and
   `PathParam(ctx, name)` (defensively copies the map in and out).
 
+### 17. Operational Subsystems (built, not yet wired)
+
+Four operational subsystems were added after the initial walkthrough was
+written. **All compile and `go vet` clean, and none are instantiated by
+`main.go`** — they share the same "built ≠ live" status as the data plane.
+
+- **Graceful shutdown** (`internal/server/shutdown.go`). `ShutdownManager`
+  coordinates a clean exit in three phases: (1) flip an `atomic.Bool` so
+  `Wrap`-ed handlers reject new requests with `503`, (2) `WaitGroup`-wait for
+  in-flight requests (bounded by the shutdown context), (3) run every registered
+  `ShutdownHook.Close(ctx)` so background workers drain. `GracefulServer` ties an
+  `*http.Server` to the manager with `Start()`/`Shutdown(ctx)`. Components
+  register themselves via `RegisterHook(name, closeFn)`.
+  > 🔴 `main.go` still calls `server.New(...).Start()` (bare mux, no signal
+  > handling), so none of this runs and `SIGTERM` kills the process abruptly.
+
+- **Async usage tracking** (`internal/services/usage.go` +
+  `internal/middleware/usage_middleware.go`). `AsyncUsageTracker` owns a buffered
+  channel and a background worker that persists `models.Usage` rows via the usage
+  repo, exposing metrics (`gateway_usage_events_total`,
+  `…_dropped_total`, `…_persisted_total`) and a `Close(ctx)` that drains the
+  queue. `UsageMiddleware` tees the response (status + bytes), builds a `Usage`
+  record from resolved context, and `Enqueue`s it **without blocking the client**.
+  > 🔴 `NewAsyncUsageTracker`/`NewUsageMiddleware` are never called, so no usage
+  > is recorded. Also depends on **B4** — the usage repo SQL still references
+  > `path`/`"timestamp"` columns that don't exist in the table.
+
+- **Health & readiness** (`internal/services/health.go`,
+  `internal/handlers/health_handlers.go`, `internal/models/health.go`).
+  `HealthChecker.Liveness` answers "is the process up?" (uptime, no I/O);
+  `Readiness` pings the DB and probes each configured upstream's health path and
+  reports a structured `ReadinessStatus`. `NewHealthHandler` serves `GET /health`
+  (always 200 if alive) and `NewReadyHandler` serves `GET /ready` (200, or 503
+  when not ready).
+  > 🔴 `NewHealthChecker` is never constructed and the handlers are never routed.
+
+- **Edge middleware — CORS + security headers** (`internal/middleware/edge.go`).
+  `EdgePolicy` bundles a `CORSPolicy` and a `SecurityHeadersPolicy`;
+  `NewEdgeMiddleware(policy)` validates it once and returns a
+  `func(http.Handler) http.Handler` that answers CORS preflight (`OPTIONS`) and
+  stamps security headers (`X-Frame-Options`, HSTS, CSP, referrer policy, …) on
+  every response.
+  > 🔴 `NewEdgeMiddleware` is never applied to the router.
+
+> Wiring all four is tracked as **R11–R14** in [TODO.md](TODO.md).
+
 ---
 
 ## Function Reference
@@ -2617,8 +2675,13 @@ Because the mux has **no routes** and nothing else is wired:
 - Every request is logged and answered with **`404 page not found`**.
 - The database is **never opened** (`config.NewDatabase` is unused).
 - Repositories, services, handlers, router, proxy, rate limiter, circuit
-  breaker, cache layer, and the metrics registry are **compiled but never
+  breaker, cache layer, the metrics registry, the **graceful-shutdown manager**,
+  the **async usage tracker**, the **health/readiness checker**, and the
+  **edge (CORS + security-headers) middleware** are **compiled but never
   instantiated** at runtime (the logger is the sole live component).
+- There is **no signal handling** — `srv.Start()` blocks on `ListenAndServe()`
+  and the process is killed abruptly on `SIGTERM` even though a full
+  `GracefulServer`/`ShutdownManager` exists in `server/shutdown.go`.
 
 In other words: **the building blocks are written and individually coherent, but
 the application is not assembled.** Wiring it together (in `server.New` or a new
@@ -2759,9 +2822,11 @@ These were found by reading the code against the migrations. The project
 - [ ] **C6 — No tests.** There are zero `_test.go` files despite extensive doc
   comments referencing test scenarios.
 
-See [TODO.md](TODO.md) for the P2 build-out items (R1–R8: data-plane wiring,
+See [TODO.md](TODO.md) for the P2 build-out items (R1–R14: data-plane wiring,
 config secrets, upstream persistence, usage writes, refresh endpoint, revocation,
-hardening, admin API) and a suggested order of attack.
+hardening, admin API, cache & observability wiring, plus the newer R11–R14 —
+graceful-shutdown, async usage tracking, health endpoints, and edge/CORS
+middleware wiring) and a suggested order of attack.
 
 ---
 
@@ -2797,7 +2862,11 @@ The **Notes** column links each area to the relevant [TODO.md](TODO.md) item(s).
 | `CachedResponse` (serialisation, replay, key builders) | ✅ | ❌ | Built; consumed by ResponseCacheMiddleware → R9 |
 | Response cache middleware (`captureWriter`, policy) | ✅ | ❌ | Built; not registered on any route → R9 |
 | Rate limiting (token bucket)           |   ✅   |        ❌        | In-memory; not routed → R1 |
-| Usage metering                         |   ⚠️   |        ❌        | Model+repo exist; no writer → B4, R4 |
+| Usage metering (model + repo)          |   ⚠️   |        ❌        | Repo SQL mismatches table → B4 |
+| Async usage tracking (queue + worker + middleware) | ✅ | ❌ | `AsyncUsageTracker` + `UsageMiddleware` built; never constructed → R12, R4 |
+| Health / readiness checks (`/health`, `/ready`) | ✅ | ❌ | `HealthChecker` + handlers built; not routed → R13 |
+| Graceful shutdown (`ShutdownManager`, `GracefulServer`) | ✅ | ❌ | Built; `main.go` still calls bare `srv.Start()`, no signal handling → R11 |
+| Edge middleware (CORS + security headers) | ✅ | ❌ | `EdgePolicy` / `NewEdgeMiddleware` built; never applied → R14 |
 | Refresh-token endpoint                 |   ❌   |        ❌        | Service exists; no handler → R5 |
 | Admin/dashboard API                    |   ❌   |        ❌        | Not started → R8 |
 | Tests                                  |   ❌   |        ❌        | None → C6 |
@@ -2831,10 +2900,21 @@ In rough priority order to get from "library" to "running gateway":
 5. **Persist upstreams & usage:** add an `upstreams` table + repository, and
    write `Usage` rows from the proxy path (capture bytes in/out).
 6. **Add a refresh endpoint** and (later) token revocation using the `jti`.
-7. **Operational hardening:** `db.Ping()` on startup, graceful shutdown,
+7. **Wire the operational subsystems that already exist** (built but dormant):
+   - **Graceful shutdown (R11):** swap `server.New` for the `GracefulServer` +
+     `ShutdownManager`, add `SIGINT`/`SIGTERM` handling, and register every
+     background worker via `RegisterHook` so they drain on exit.
+   - **Async usage tracking (R12):** construct `AsyncUsageTracker`, wrap proxied
+     routes with `UsageMiddleware`, and register `tracker.Close` as a shutdown
+     hook. (This is the concrete implementation of R4.)
+   - **Health & readiness (R13):** construct `HealthChecker` and route
+     `GET /health` (liveness) + `GET /ready` (DB ping + upstream probes).
+   - **Edge middleware (R14):** move the CORS/security-header policy into config
+     and apply `NewEdgeMiddleware` as global router middleware.
+8. **Remaining operational hardening:** `db.Ping()` on startup (C5), a
    `PruneIdle` goroutine for the limiter, and a real migration runner.
-8. **Add tests** — the components are highly testable (clock injection, repo
-   interfaces, pure helpers) and currently have none.
+9. **Add tests** — the components are highly testable (clock injection, repo
+   interfaces, pure helpers) and currently have none (C6).
 
 ---
 
