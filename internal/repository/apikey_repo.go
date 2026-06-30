@@ -44,7 +44,6 @@ func (r *postgresAPIKeyRepo) Create(ctx context.Context, key models.APIKey) (mod
 	var out models.APIKey
 
 	err = r.db.QueryRowContext(ctx, q,
-		normalized.ID,
 		normalized.TenantID,
 		normalized.KeyHash,
 		normalized.Description,

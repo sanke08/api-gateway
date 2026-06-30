@@ -11,25 +11,29 @@ The single external dependency is `github.com/lib/pq` (the PostgreSQL driver).
 All security primitives (password hashing, API-key hashing, JWT signing) are
 hand-rolled on top of `crypto/*`.
 
-> ⚠️ **Project status — read this first.**
-> This repository is a **library of well-built, individually-correct components
-> that are not yet assembled into a running application**, and it currently has
-> several **schema/code mismatches and bugs that prevent it from running end to
-> end**. `main.go` starts an HTTP server that serves **only an empty mux + a
-> logging middleware** — none of the router, database, services, handlers,
-> proxy, or rate limiter is wired in. See
-> [What Actually Runs Today](#what-actually-runs-today) and
-> [Known Issues & Bugs](#known-issues--bugs-must-fix-before-it-runs) before
-> trying to use it. The component descriptions below document the code **as
-> written**; the issues section documents what stops it from working.
+> ✅ **Project status — read this first.**
+> The gateway is **assembled and runs end to end.** `main.go` opens the database
+> (with a startup `Ping`), builds the repositories, services, JWT manager,
+> metrics registry, cache, reverse proxy, and rate limiter, constructs the trie
+> router, registers the control-plane and data-plane routes, and serves them
+> behind a graceful-shutdown server. The earlier "empty mux, 404 for every path"
+> state is **gone**. The schema/SQL mismatches that used to block it are fixed,
+> and the full request path (onboard-seeded auth → proxy → rate limit → retry →
+> circuit breaker) has been exercised end-to-end under `go test -race`.
+> See [What Actually Runs Today](#what-actually-runs-today).
 >
-> 📋 **A complete, prioritized checklist of every fix and build-out task lives in
-> [TODO.md](TODO.md)** — work through it one item at a time (B1–B9 blocking,
-> C1–C6 cleanups, R1–R14 roadmap). It also tracks **what's done vs. remaining**.
-> As of 2026-06-28 the project still **builds and `go vet`s cleanly with 0
-> tests**, and **none** of B1–B9 / C1–C6 have been fixed — four more subsystems
-> (graceful shutdown, async usage tracking, health checks, edge/CORS middleware)
-> have been *built* but, like everything else, are not yet wired in.
+> 📋 **The prioritized checklist lives in [TODO.md](TODO.md).** As of
+> **2026-06-30**: `go build ./...` and `go vet ./...` pass; **all P0 blocking
+> bugs (B1–B9) are fixed**; the data plane, observability, cache, graceful
+> shutdown, async usage tracking, health endpoints, and edge/CORS are all wired.
+> Two further bugs were found and fixed this round by end-to-end simulation — an
+> **API-key INSERT parameter-count mismatch** (broke onboarding) and a **missing
+> router catch-all** for `/{path...}` (broke multi-segment proxying). Remaining
+> work is cleanup + roadmap: committing the test suite, a handful of known
+> non-blocking bugs (see [Known Issues](#known-issues--known-limitations)), and
+> feature build-out. **Note:** running for real still needs a reachable
+> PostgreSQL (the onboarding transaction requires it); the simulation stands in
+> in-memory repositories where Postgres isn't available.
 
 ---
 
@@ -117,7 +121,7 @@ STYLE: Hand-drawn whiteboard diagram in the Excalidraw / Eraser.io aesthetic.
 12. [Configuration Reference](#configuration-reference)
 13. [Usage / API Reference](#usage--api-reference)
 14. [What Actually Runs Today](#what-actually-runs-today)
-15. [Known Issues & Bugs](#known-issues--bugs-must-fix-before-it-runs)
+15. [Known Issues & Known Limitations](#known-issues--known-limitations)
 16. [Feature Status](#feature-status)
 17. [Roadmap & Next Steps](#roadmap--next-steps)
 
@@ -448,23 +452,31 @@ Hand-drawn Excalidraw style, portrait or square orientation.
 
 ### 1. Entry Point & Server
 
-**`internal/cmd/gateway/main.go`** — the `main()` function:
+**`internal/cmd/gateway/main.go`** — the `main()` function now performs full
+bootstrap, in order:
 
-1. `observability.InitLogger()` — set up the JSON slog logger.
-2. `config.Load()` — read env vars into a `Config` (and validate).
-3. `server.New(cfg.Port)` — build the HTTP server.
-4. `srv.Start()` — `ListenAndServe`.
+1. `observability.InitLogger()` — JSON slog logger.
+2. `config.Load()` — env → `Config` (+ `Validate`).
+3. `config.NewDatabase(cfg)` — open the pool **and `Ping`** it (fail fast).
+4. `repository.NewPostgresRepositories(db)` — wire the five repos.
+5. `services.NewJWTManager(...)` + onboarding / auth / API-key-auth / tenant-resolver services.
+6. `observability.NewRegistry()` — metrics.
+7. Cache: `MemoryStore`, optionally wrapped in a `HybridStore` when `CACHE_REMOTE_URL` is set.
+8. Build a `proxy.StaticRegistry` from configured upstreams and a `proxy.Handler`.
+9. `AsyncUsageTracker`, rate `Limiter` + middleware.
+10. Chain the data plane: API-key / tenant-resolution auth → rate limit → usage → proxy.
+11. `HealthChecker`, HTTP handlers, edge (CORS + security) + response-cache middleware.
+12. Construct the **trie router**, register routes, wrap with `ShutdownManager`,
+    serve via `GracefulServer` with SIGINT/SIGTERM handling and a 30s drain.
 
-**`internal/server/server.go`** — `Server` wraps an `*http.Server`.
-`New(addr)` creates an **empty `http.NewServeMux()`** wrapped only with
-`middleware.LoggingMiddleware`. `Start()` calls `ListenAndServe()`.
+**Registered routes:** `POST /onboard`, `POST /login`, `GET /metrics`,
+`GET /health`, `GET /ready`, and — when upstreams are configured — the proxied
+data-plane catch-alls `GET|POST|PUT|PATCH|DELETE /{path...}`.
 
-> 🔴 **Critical gap:** `New()` never registers any routes and never touches the
-> `Router`, database, services, handlers, proxy, or rate limiter. As written,
-> the running server logs requests and returns **404 for every path**. All the
-> other components exist but are unreferenced by the live process. This is the
-> single biggest thing to fix to get a working gateway (see
-> [What Actually Runs Today](#what-actually-runs-today)).
+> ✅ The server now wires the router, database, services, handlers, proxy, rate
+> limiter, observability, cache, health, edge, and graceful shutdown. (Earlier
+> revisions of this README described an "empty mux" `server.New` — that path is
+> no longer used by `main.go`.) See [What Actually Runs Today](#what-actually-runs-today).
 
 ### 2. Configuration
 
@@ -477,11 +489,13 @@ reads env with typed helpers:
 - `getEnvAsDuration(key, default)` — panics if not a Go duration (e.g. `1h`).
 
 **`internal/config/database.go`** — `DBConfig` holds DSN, driver, pool sizing.
-`NewDatabase(cfg)` opens `sql.Open(driver, dsn)` and configures
-`SetMaxIdleConns` / `SetMaxOpenConns` / `SetConnMaxLifetime`.
+`NewDatabase(cfg)` opens `sql.Open(driver, dsn)`, configures
+`SetMaxIdleConns` / `SetMaxOpenConns` / `SetConnMaxLifetime`, and then runs
+`PingContext` with a timeout so a bad DSN fails at startup rather than on the
+first query.
 
-> Note: `sql.Open` does **not** verify connectivity. There is no `db.Ping()`
-> anywhere, and `NewDatabase` is never called by `main.go`.
+> Note: `main.go` calls `NewDatabase` during bootstrap (step 3) and aborts if
+> the `Ping` fails.
 
 **`internal/config/validator.go`** — `Validate(cfg)` requires `Port`, `DB.DSN`,
 `DB.Driver`, and non-zero `MaxIdleConns` / `MaxOpenConns`.
@@ -710,8 +724,10 @@ in the codebase** — you apply these manually (e.g. via `psql`).
 | `004` | `usage`           | FKs→tenants & api_keys; column named **`endpoint`**; has `created_at`/`updated_at`, **no `timestamp`** |
 | `005` | `tenant_memberships` | Role/status CHECKs; unique `(user_id, tenant_id)`; both-direction indexes |
 
-> 🔴 Several of these DDL files **do not match the SQL the repositories run**, and
-> `001` has a syntax error. See [Known Issues](#known-issues--bugs-must-fix-before-it-runs).
+> ✅ The DDL now matches the SQL the repositories run (the old trailing-comma,
+> `password`/`password_hash`, usage `path`/`timestamp`, `expires_at`, and
+> status-CHECK mismatches are all fixed). There is still **no migration runner**
+> — apply the files by hand (see [Setup](#setup--installation)).
 
 ### 6. Repository Layer
 
@@ -855,11 +871,21 @@ API-key hash.
   validated; duplicate (method, structural-key) routes are rejected.
 - **Param extraction.** Matched param values are zipped with their names and
   attached via `requesttypes.WithPathParams` for handlers to read.
+- **Catch-all segments.** A trailing `{name...}` segment matches the **entire
+  remainder** of the path (zero or more components) and captures it (joined by
+  `/`) under `name`. It is tried **after** static and single-param children, so
+  specificity still wins, and it must be the final segment. This is what backs
+  the proxied `/{path...}` data-plane routes.
 - **Custom 404/405.** `SetNotFoundHandler` / `SetMethodNotAllowedHandler`.
 
-> 🔴 This router is fully built and self-consistent but **is not instantiated
-> anywhere** (`NewRouter()` is only referenced in its own doc comment). The live
-> server uses a bare `http.ServeMux` instead.
+> ✅ `main.go` calls `NewRouter()`, registers the control- and data-plane
+> routes on it, and serves it (wrapped by the shutdown manager). The bare
+> `http.ServeMux` is no longer used.
+>
+> 🐛 **Fixed 2026-06-30:** catch-all support did not exist — `{path...}` was
+> parsed as an ordinary single-segment param, so `/{path...}` matched only
+> single-segment paths and any deeper request (`/orders/123`) returned 404 and
+> never reached the proxy. The router now supports real catch-all matching.
 
 <!-- IMAGE: replace this line with the generated diagram -->
 ![Router Trie & Two-Plane Design](docs/images/10-router-trie.png)
@@ -935,10 +961,12 @@ Hand-drawn Excalidraw style, landscape, tidy tree with no crossing edges.
 - **`transform.go`** — shared header add/remove + request path rewrite helpers
   (headers and path only; **bodies are not transformed**).
 
-> The proxy is wired to take its upstreams from a `Registry`, but **no registry
-> is ever constructed or populated** (`UpstreamTarget` rows have no table and no
-> repository). So even once routes are wired, there are no upstreams to forward
-> to until a registry is built.
+> ✅ `main.go` builds a `proxy.StaticRegistry` from the upstreams in config
+> (`UPSTREAMS_JSON`) and constructs the `proxy.Handler` from it. When no
+> upstreams are configured the proxied routes are simply not registered (the
+> control-plane routes still serve). **Still in-memory only:** there is no
+> `upstreams` table/repository yet (roadmap **R3**), so upstreams must be
+> supplied via env.
 
 ### 12. Rate Limiting
 
@@ -960,7 +988,11 @@ Hand-drawn Excalidraw style, landscape, tidy tree with no crossing edges.
   **after** an auth/resolution middleware.
 
 > Buckets live in process memory, so limits are **per-instance**, not shared
-> across replicas. Not wired into the server yet.
+> across replicas. The limiter **is wired** on proxied routes (`main.go` uses
+> `KeyTenant`); a background `PruneIdle` goroutine reclaims stale buckets.
+> Caveat: the proxy chain serves both auth paths, so the keyfunc must work for
+> both — `KeyTenant` does; `KeyAPIKey`/`KeyUser` would error on the path that
+> doesn't resolve that identity.
 
 <!-- IMAGE: replace this line with the generated diagram -->
 ![Token-Bucket Rate Limiter](docs/images/11-token-bucket.png)
@@ -1716,41 +1748,39 @@ through the pipeline without globals:
 - **`path_params.go`** — `WithPathParams`, `PathParamsFromContext`, and
   `PathParam(ctx, name)` (defensively copies the map in and out).
 
-### 17. Operational Subsystems (built, not yet wired)
+### 17. Operational Subsystems (wired)
 
-Four operational subsystems were added after the initial walkthrough was
-written. **All compile and `go vet` clean, and none are instantiated by
-`main.go`** — they share the same "built ≠ live" status as the data plane.
+Four operational subsystems added after the initial walkthrough. **All are now
+instantiated by `main.go`** (formerly **R11–R14**, now done).
 
 - **Graceful shutdown** (`internal/server/shutdown.go`). `ShutdownManager`
   coordinates a clean exit in three phases: (1) flip an `atomic.Bool` so
   `Wrap`-ed handlers reject new requests with `503`, (2) `WaitGroup`-wait for
   in-flight requests (bounded by the shutdown context), (3) run every registered
   `ShutdownHook.Close(ctx)` so background workers drain. `GracefulServer` ties an
-  `*http.Server` to the manager with `Start()`/`Shutdown(ctx)`. Components
-  register themselves via `RegisterHook(name, closeFn)`.
-  > 🔴 `main.go` still calls `server.New(...).Start()` (bare mux, no signal
-  > handling), so none of this runs and `SIGTERM` kills the process abruptly.
+  `*http.Server` to the manager with `Start()`/`Shutdown(ctx)`.
+  > ✅ `main.go` wraps the router with `ShutdownManager.Wrap`, serves it via
+  > `GracefulServer`, listens for SIGINT/SIGTERM, and drains for up to 30s. The
+  > usage tracker, cache pruner, and limiter pruner are registered as hooks.
 
 - **Async usage tracking** (`internal/services/usage.go` +
   `internal/middleware/usage_middleware.go`). `AsyncUsageTracker` owns a buffered
   channel and a background worker that persists `models.Usage` rows via the usage
-  repo, exposing metrics (`gateway_usage_events_total`,
-  `…_dropped_total`, `…_persisted_total`) and a `Close(ctx)` that drains the
-  queue. `UsageMiddleware` tees the response (status + bytes), builds a `Usage`
-  record from resolved context, and `Enqueue`s it **without blocking the client**.
-  > 🔴 `NewAsyncUsageTracker`/`NewUsageMiddleware` are never called, so no usage
-  > is recorded. Also depends on **B4** — the usage repo SQL still references
-  > `path`/`"timestamp"` columns that don't exist in the table.
+  repo, exposing metrics and a `Close(ctx)` that drains the queue.
+  `UsageMiddleware` tees the response (status + bytes), builds a `Usage` record
+  from resolved context, and `Enqueue`s it **without blocking the client**.
+  > ✅ Constructed in `main.go` and wrapped around proxied routes; `Close` is a
+  > shutdown hook. (The B4 usage-column mismatch it depended on is fixed.)
+  > 🐛 **Known bug (open):** `Enqueue` checks an `atomic.Bool` then sends on the
+  > queue while `Close` closes it — a request racing shutdown can panic on a
+  > send-to-closed-channel. Tracked as **N5** in [TODO.md](TODO.md).
 
 - **Health & readiness** (`internal/services/health.go`,
   `internal/handlers/health_handlers.go`, `internal/models/health.go`).
   `HealthChecker.Liveness` answers "is the process up?" (uptime, no I/O);
-  `Readiness` pings the DB and probes each configured upstream's health path and
-  reports a structured `ReadinessStatus`. `NewHealthHandler` serves `GET /health`
-  (always 200 if alive) and `NewReadyHandler` serves `GET /ready` (200, or 503
-  when not ready).
-  > 🔴 `NewHealthChecker` is never constructed and the handlers are never routed.
+  `Readiness` pings the DB and probes each configured upstream's health path.
+  > ✅ `NewHealthChecker` is constructed and `GET /health` + `GET /ready` are
+  > routed.
 
 - **Edge middleware — CORS + security headers** (`internal/middleware/edge.go`).
   `EdgePolicy` bundles a `CORSPolicy` and a `SecurityHeadersPolicy`;
@@ -1758,9 +1788,13 @@ written. **All compile and `go vet` clean, and none are instantiated by
   `func(http.Handler) http.Handler` that answers CORS preflight (`OPTIONS`) and
   stamps security headers (`X-Frame-Options`, HSTS, CSP, referrer policy, …) on
   every response.
-  > 🔴 `NewEdgeMiddleware` is never applied to the router.
+  > ✅ Applied as a global `router.Use(...)`.
+  > 🐛 **Known bug (open):** the `ContentTypeNosniff` config field is dead —
+  > `policy.ContentTypeNosniff || !policy.ContentTypeNosniff` is always `true`,
+  > so the header can't be disabled (fails secure). Tracked as **N9**.
 
-> Wiring all four is tracked as **R11–R14** in [TODO.md](TODO.md).
+> All four are wired. Remaining edge/usage bugs are tracked in
+> [Known Issues](#known-issues--known-limitations).
 
 ---
 
@@ -1971,8 +2005,8 @@ Clean spacing, crow's-foot cardinality, hand-drawn Excalidraw ERD style.
   `ON DELETE CASCADE`).
 - **UpstreamTarget** exists only as a Go struct + in-memory `StaticRegistry`;
   there is no SQL table or repository for it.
-- (`*` marks columns that currently mismatch the repository code — see
-  [Known Issues](#known-issues--bugs-must-fix-before-it-runs).)
+- The migration columns now match the repository code (the earlier mismatches
+  are fixed — see [Known Issues](#known-issues--known-limitations)).
 
 ---
 
@@ -2225,8 +2259,10 @@ Hand-drawn Excalidraw style, horizontal order, clean reject branches.
 
 </details>
 
-> Flows C and D are the **intended** request lifecycle. They are not reachable
-> today because the middleware/proxy/router are not wired into `main.go`.
+> Flows C and D are the data-plane request lifecycle. They **are** reachable now:
+> `main.go` wires the auth middleware, proxy, and router and registers the
+> `/{path...}` routes (they activate when upstreams are configured). Verified
+> end-to-end in the `-race` simulation.
 
 ---
 
@@ -2530,10 +2566,9 @@ go mod download
 
 ### 2. Create the database & apply migrations
 
-> ⚠️ The migration files currently have bugs (see
-> [Known Issues](#known-issues--bugs-must-fix-before-it-runs)) — in particular
-> `001` has a trailing-comma syntax error, and columns in `002`/`004` don't
-> match the repository SQL. Fix those before (or while) applying them.
+> ℹ️ The migration files now match the repository SQL. There is **no migration
+> runner** yet (roadmap **R7**), so apply the files in `internal/db/migrations/`
+> in numeric order by hand (e.g. with `psql`).
 
 ```bash
 createdb api_gateway     # or: CREATE DATABASE api_gateway;
@@ -2651,7 +2686,7 @@ Response `200 OK`:
 Errors: `400` validation, `401` invalid credentials / no active membership,
 `500` internal.
 
-### Intended data-plane headers (once the proxy is wired)
+### Data-plane headers
 
 - Machine calls: `X-API-Key: gw_live_…`
 - Human calls: `Authorization: Bearer <access_token>` **and** `X-Tenant-ID: <tenant id>`
@@ -2664,169 +2699,103 @@ Errors: `400` validation, `401` invalid credentials / no active membership,
 
 ## What Actually Runs Today
 
-Running `go run ./internal/cmd/gateway` today does exactly this:
+Running `go run ./internal/cmd/gateway` (with `DB_DSN`, `JWT_SECRET`, and a
+reachable PostgreSQL) now boots the **full application**:
 
 1. Initializes the JSON logger.
-2. Loads & validates config (panics if `DB_DSN` is unset).
-3. Starts `http.Server` with handler = `LoggingMiddleware(emptyMux)`.
+2. Loads & validates config (panics if `DB_DSN` / `JWT_SECRET` are unset).
+3. Opens the DB pool and **`Ping`s** it — aborts on failure.
+4. Builds repositories, services, JWT manager, metrics registry, cache, proxy
+   (from configured upstreams), rate limiter, async usage tracker, and health
+   checker.
+5. Constructs the **trie router**, applies global middleware (edge/CORS →
+   observability → logging), and registers routes:
+   - `POST /onboard`, `POST /login` — control plane
+   - `GET /metrics`, `GET /health`, `GET /ready` — operational
+   - `GET|POST|PUT|PATCH|DELETE /{path...}` — proxied data plane (only when
+     upstreams are configured), each wrapped with auth → rate limit → usage →
+     response-cache → proxy
+6. Wraps the router with `ShutdownManager`, serves via `GracefulServer`, and
+   drains for up to 30s on SIGINT/SIGTERM.
 
-Because the mux has **no routes** and nothing else is wired:
+Verified end-to-end under `go test -race` (with in-memory repositories standing
+in for Postgres): login + token refresh, tenant isolation, multi-segment
+proxying, 401s for bad/absent credentials, rate-limit 429 + `Retry-After`,
+retry recovery of transient 5xx, and circuit-breaker open→half-open→close.
 
-- Every request is logged and answered with **`404 page not found`**.
-- The database is **never opened** (`config.NewDatabase` is unused).
-- Repositories, services, handlers, router, proxy, rate limiter, circuit
-  breaker, cache layer, the metrics registry, the **graceful-shutdown manager**,
-  the **async usage tracker**, the **health/readiness checker**, and the
-  **edge (CORS + security-headers) middleware** are **compiled but never
-  instantiated** at runtime (the logger is the sole live component).
-- There is **no signal handling** — `srv.Start()` blocks on `ListenAndServe()`
-  and the process is killed abruptly on `SIGTERM` even though a full
-  `GracefulServer`/`ShutdownManager` exists in `server/shutdown.go`.
-
-In other words: **the building blocks are written and individually coherent, but
-the application is not assembled.** Wiring it together (in `server.New` or a new
-bootstrap function) is the primary integration task.
-
-<!-- IMAGE: replace this line with the generated diagram -->
-![What Runs Today vs What's Built](docs/images/13-wired-vs-built.png)
-
-<details>
-<summary><b>🎨 Gemini prompt — "Wired vs. Built" reality check</b> (save as <code>docs/images/13-wired-vs-built.png</code>)</summary>
-
-```text
-[PASTE THE SHARED STYLE PREAMBLE FIRST]
-
-DIAGRAM: "What Actually Runs Today vs. What's Built (not yet wired)"
-
-Split the canvas into TWO clearly separated zones with a bold hand-drawn divider
-down the middle. Title banner: "Reality check: compiled ≠ assembled".
-
-LEFT ZONE — header in GREEN: "✅ LIVE TODAY (reachable at runtime)".
-  Draw a simple vertical flow with solid arrows:
-  🌐 "HTTP request" → green "http.Server" → green "LoggingMiddleware
-  (X-Request-ID + access log)" → green "empty http.ServeMux" → red chip
-  "404 for every path".
-  Small note: "config loads (panics if DB_DSN unset); JSON logger active".
-
-RIGHT ZONE — header in GRAY/RED: "🚧 BUILT BUT NOT WIRED (never instantiated at
-runtime)". Draw these as a loose grid of DASHED-outline gray boxes, each with a
-🚧 tag:
-  "Router (trie)", "PostgreSQL connection (NewDatabase unused)",
-  "Repositories ×5", "Onboarding / Auth / APIKeyAuth / TenantResolution
-  services", "JWTManager", "APIKeyAuth & TenantResolution middleware",
-  "Handlers (/onboard, /login)", "Proxy + StaticRegistry", "RateLimiter",
-  "RetryTransport", "CircuitBreakerTransport",
-  "RemoteClient + MemoryStore + HybridStore (cache)".
-  Caption under the grid: "All compile; go vet is clean; none are referenced by
-  main.go."
-
-BOTTOM — a bridge arrow from RIGHT zone back to LEFT labeled in big friendly
-handwriting: "TODO: assemble in a bootstrap → open DB, build repos+services,
-construct Router, register routes, serve router instead of empty mux".
-
-Make the contrast obvious: LEFT solid/colored/alive, RIGHT dashed/gray/dormant.
-Hand-drawn Excalidraw style, landscape.
-```
-
-</details>
-
-A minimal assembly would look roughly like:
-
-```go
-db, _ := config.NewDatabase(cfg)
-repos := repository.NewPostgresRepositories(db)
-jwt, _ := services.NewJWTManager(secret, "api-gateway", 15*time.Minute, 24*time.Hour)
-
-onboarding := services.NewOnboardingService(db, repos)
-auth       := services.NewAuthService(repos, jwt)
-apiKeyAuth := services.NewAPIKeyAuthService(repos)
-resolver   := services.NewTenantResolver(repos, jwt)
-
-r := server.NewRouter()
-r.Use(middleware.LoggingMiddleware)
-r.POST("/onboard", handlers.NewOnboardingHandler(onboarding))
-r.POST("/login",   handlers.NewAuthHandler(auth))
-// + data-plane routes wrapped with APIKeyAuth/TenantResolution + ratelimit → proxy
-```
-
-…plus building a `proxy.StaticRegistry` of `UpstreamTarget`s and pointing
-`server.New` at the router instead of a bare mux.
+> **Caveat:** a real run needs a reachable PostgreSQL — the onboarding flow
+> opens a transaction (`db.BeginTx`). Without a DB, `main.go` aborts at the
+> startup `Ping`. The simulation substitutes in-memory repos to exercise the
+> rest of the pipeline.
 
 ---
 
-## Known Issues & Bugs (must fix before it runs)
+## Known Issues & Known Limitations
 
-These were found by reading the code against the migrations. The project
-**compiles** and `go vet` is clean, but the following will fail at runtime.
+The blocking bugs are fixed and the app runs. The items below are **non-blocking
+bugs and gaps** found by code review and end-to-end simulation. None break the
+happy path.
 
-> 📋 **Tracked as a checklist in [TODO.md](TODO.md)** — tick items off there as
-> you fix them. IDs below (B#/C#) match the TODO so the two stay in sync.
-> Replace `[ ]` with `[x]` here too when an item is done.
+> 📋 **Tracked as a checklist in [TODO.md](TODO.md)** (the `N#` / `C#` / `R#`
+> IDs there match the descriptions below). Replace `[ ]` with `[x]` when fixed.
 
-**Status:** 🔴 0 / 9 blocking fixed · 🟡 0 / 6 cleanups done.
+**Status:** ✅ 9 / 9 blocking fixed · ✅ 4 / 6 cleanups done · 10 known
+non-blocking bugs open.
 
-### 🔴 Blocking — app is not assembled
-- [ ] **B1 — Nothing is wired.** `main.go`/`server.New` serve an empty mux; DB,
-  repos, services, handlers, router, proxy, and rate limiter are never
-  instantiated. The live server returns 404 for everything.
+### 🐛 Open non-blocking bugs (from review + simulation)
 
-### 🔴 Blocking — schema/SQL mismatches (queries will error)
-- [ ] **B2 — `001_create_tenants.sql` has a trailing comma** after `updated_at`
-  (line 33), so the `CREATE TABLE tenants` statement is invalid SQL and won't
-  apply.
-- [ ] **B3 — `002_create_users.sql` defines column `password`**, but `user_repo`
-  INSERTs/SELECTs **`password_hash`**. One of them must change (the code expects
-  `password_hash`).
-- [ ] **B4 — `004_usage.sql` defines `endpoint`** (and `created_at`/`updated_at`,
-  **no `timestamp`**), but `usage_repo` INSERT/SELECT use columns **`path`** and
-  **`"timestamp"`**. These names don't exist in the table.
-- [ ] **B5 — `api_keys` queries reference `expires_at`.** `apikey_repo`'s
-  `Create`, `GetByID`, `GetByHash`, and `ListByTenant` all `SELECT … expires_at …`,
-  but migration `003` has no `expires_at` column **and** the `APIKey` model has
-  no such field — so the queries reference a non-existent column.
+- **N1 — Login timing side-channel.** `AuthService.Login` skips PBKDF2 on an
+  unknown email but runs it (210k iters) for a known one → email enumeration.
+  Fix: verify against a decoy hash on the not-found path.
+- **N2 — Retry backoff overflow.** `nextBackoff`'s `1 << (attempt-1)` overflows
+  (~attempt 39) with no cap on `Attempts` → negative delay → retry storm.
+- **N3 — Rate-limit `Retry-After` floored to 1s** even for sub-second waits.
+- **N4 — `tenant_repo.GetBySlug` never sets `Status`** (unlike `GetByID`).
+- **N5 — Async usage tracker send-on-closed-channel race** during shutdown
+  (can panic). See §17.
+- **N6 — `LoggingMiddleware` drops `Flusher`/`Hijacker`/`Pusher`** → breaks
+  SSE/streaming/WebSocket through the proxy.
+- **N7 — Proxy `RewritePath` clobbers the base-URL path prefix.**
+- **N8 — Router `r.state` is a plain pointer, not `atomic.Pointer`** (benign
+  with startup-only registration).
+- **N9 — `edge.go` `ContentTypeNosniff` knob is dead** (`X || !X`). See §17.
+- **N10 — Rate-limit keyfunc coupling:** the shared proxy chain serves both auth
+  paths; `KeyAPIKey`/`KeyUser` would 500 on the path that doesn't resolve that
+  identity (`main.go` uses `KeyTenant`, which is safe).
 
-### 🔴 Blocking — `Scan`/column count mismatches (runtime scan errors)
-- [ ] **B6 — `user_repo.Create`** runs `RETURNING id` (1 column) but `.Scan()`
-  into **5** destinations (`Id, Email, PasswordHash, CreatedAt, UpdatedAt`). This
-  will fail with a scan-count error.
-- [ ] **B7 — `apikey_repo` reads 8 columns but Scans 7.** The `SELECT`/`RETURNING`
-  lists 8 columns (incl. `expires_at`) while `.Scan()` binds 7 fields → count
-  mismatch (on top of the missing column in B5).
-- [ ] **B8 — `membership.Create` parameter/column shift.** The INSERT lists 4
-  columns `(user_id, tenant_id, role, status)` but passes **5** values starting
-  with `normalized.ID`, so values are shifted (the membership `ID` is sent into
-  the `user_id` slot). It also `RETURNING` 5 columns but `.Scan()` into 7.
-- [ ] **B9 — App-generated UUID vs DB default mismatch.** Services generate UUIDs
-  with `newUUIDString()` and pass them, but most INSERTs **omit the `id` column**
-  (relying on `gen_random_uuid()`), so the generated IDs are silently dropped
-  for users/api_keys/memberships. `tenant_repo.Create` *does* insert `id` but
-  also writes the zero-value `created_at`/`updated_at` (services never set them),
-  which conflicts with the `DEFAULT CURRENT_TIMESTAMP` intent.
+### 🧹 Remaining cleanups
 
-### 🟡 Non-blocking — correctness / cleanliness
-- [ ] **C1 — Dead `case` in `mapRepositoryError`.** `errors.go` has two
-  `case ErrValidation.Kind:` branches; the second is unreachable (it compiles
-  only because the case values are runtime field reads, not constants).
-- [ ] **C2 — `tenants` status CHECK vs model.** Migration `001` allows
-  `('active','inactive')`, but the model/services use `active`/**`suspended`**.
-  Inserting a suspended tenant would violate the CHECK.
-- [ ] **C3 — `Usage.Endpoint` JSON tag** is `endpoint` in the model but the table
-  column (post-fix) should be reconciled with the repo's `path`/`endpoint`
-  choice.
-- [ ] **C4 — `retry.retryableBody` is an unused stub** (`policy.go`) returning
-  `false`; `normalizeContextErr`, `bufferBody`, `bodyFromBytes`, and the
-  `var _ sync.Locker` in `transport.go` are scaffolding that isn't currently
-  exercised.
-- [ ] **C5 — No connectivity check.** `NewDatabase` never `Ping`s, so a bad DSN
-  only surfaces on first query.
-- [ ] **C6 — No tests.** There are zero `_test.go` files despite extensive doc
-  comments referencing test scenarios.
+- **C4 — Retry dead code:** `retryableBody` (unused stub), `normalizeContextErr`,
+  `bufferBody`, `bodyFromBytes`, `var _ sync.Locker` — wire in or delete.
+- **C6 — Commit tests:** the `-race` simulation passes but isn't committed yet.
 
-See [TODO.md](TODO.md) for the P2 build-out items (R1–R14: data-plane wiring,
-config secrets, upstream persistence, usage writes, refresh endpoint, revocation,
-hardening, admin API, cache & observability wiring, plus the newer R11–R14 —
-graceful-shutdown, async usage tracking, health endpoints, and edge/CORS
-middleware wiring) and a suggested order of attack.
+### Historical: blocking bugs — ✅ all fixed
+
+The following were blocking when this README was first written. All are now
+resolved (full detail in [TODO.md](TODO.md)):
+
+| ID | Was | Now |
+| -- | --- | --- |
+| **B1** | Nothing wired — empty mux, 404 for everything | ✅ Full bootstrap in `main.go` |
+| **B2** | `001` trailing comma → invalid SQL | ✅ Fixed |
+| **B3** | users `password` vs repo `password_hash` | ✅ Migration uses `password_hash` |
+| **B4** | usage `endpoint`/`created_at` vs repo `path`/`"timestamp"` | ✅ Reconciled to `path`/`"timestamp"` |
+| **B5** | `apikey_repo` queried non-existent `expires_at` | ✅ Removed everywhere |
+| **B6** | `user_repo.Create` `RETURNING id` (1) vs Scan (5) | ✅ Returns & scans 5 |
+| **B7** | `apikey_repo` 8 columns vs Scan 7 | ✅ Column list & Scan agree |
+| **B8** | `membership.Create` 4 columns vs 5 values (shift) | ✅ 4 cols / 4 values; RETURNING 7 / Scan 7 |
+| **B9** | App UUID vs DB-default `id` mismatch | ✅ DB generates `id` + timestamps, returned via `RETURNING` |
+| **C1** | Dead `case` in `mapRepositoryError` | ✅ Resolved |
+| **C2** | tenants status CHECK `active`/`inactive` vs model `suspended` | ✅ CHECK is `active`/`suspended` |
+| **C3** | `Usage.Endpoint` naming | ✅ Reconciled to `path` |
+| **C5** | `NewDatabase` never `Ping`s | ✅ `PingContext` at startup |
+
+Plus two bugs found this round by end-to-end simulation, both fixed:
+**API-key INSERT param-count mismatch** (broke onboarding) and **missing router
+catch-all** for `/{path...}` (broke multi-segment proxying).
+
+The open items (**C4** retry dead code, **C6** commit tests, **N1–N10**
+non-blocking bugs, **R3–R10** roadmap) are tracked in [TODO.md](TODO.md).
 
 ---
 
@@ -2837,41 +2806,37 @@ The **Notes** column links each area to the relevant [TODO.md](TODO.md) item(s).
 | Area                                   | Built? | Wired & working? | Notes (→ TODO id) |
 | -------------------------------------- | :----: | :--------------: | ----- |
 | Domain models                          |   ✅   |        —         | Complete |
-| Config loading & validation            |   ✅   |     ⚠️ partial    | DB never opened → B1, C5 |
-| Structured logging (slog + req ID)     |   ✅   |        ✅         | The one live component |
-| Metrics registry (counters/gauges/durations) | ✅ | ❌ | Built; `NewRegistry()` never called → R10 |
-| Per-request trace (`Trace` + context)  |   ✅   |        ❌        | Built; `Middleware` not attached → R10 |
-| Observability middleware (timing, bytes) | ✅   |        ❌        | Built; not wired to router → R10 |
-| `/metrics` Prometheus scrape endpoint  |   ✅   |        ❌        | `MetricsHandler()` exists; not registered → R10 |
-| SQL migrations                         |   ⚠️   |        ❌        | Buggy/mismatched → B2–B5, C2 |
-| Repository layer (CRUD + tx)           |   ✅   |        ❌        | SQL mismatches → B3–B9 |
-| Onboarding service (atomic)            |   ✅   |        ❌        | Blocked by DB issues → B1–B9 |
-| Auth service / login                   |   ✅   |        ❌        | Not routed → B1 |
-| Custom JWT (HS256)                     |   ✅   |        ❌        | Issue/verify/refresh done; not routed → B1 |
-| Password hashing (PBKDF2)              |   ✅   |        —         | Complete |
-| API key auth (SHA-256)                 |   ✅   |        ❌        | Built; not routed → B1, R1 |
-| Tenant resolution                      |   ✅   |        ❌        | Built; not routed → B1, R1 |
-| Trie router                            |   ✅   |        ❌        | Never instantiated → B1 |
-| Reverse proxy (per-tenant)             |   ✅   |        ❌        | No registry → R1, R3 |
-| Request/response transforms            |   ✅   |        ❌        | Headers + path only (no body) |
-| Retry transport (backoff+jitter)       |   ✅   |     ⚠️ via proxy  | Reachable only via proxy; cleanup → C4 |
-| Circuit breaker (CLOSED/OPEN/HALF_OPEN)|   ✅   |     ⚠️ via proxy  | Transport layer; not wired end-to-end yet → R1 |
-| Remote cache client (HTTP + base64)    |   ✅   |        ❌        | Built; no env config or middleware injection → R9 |
-| In-process memory cache (TTL, prune)   |   ✅   |        ❌        | Built; not injected into middleware → R9 |
-| Hybrid cache (remote-first + fallback) |   ✅   |        ❌        | Built; not wired into auth middleware → R9 |
-| `CachedResponse` (serialisation, replay, key builders) | ✅ | ❌ | Built; consumed by ResponseCacheMiddleware → R9 |
-| Response cache middleware (`captureWriter`, policy) | ✅ | ❌ | Built; not registered on any route → R9 |
-| Rate limiting (token bucket)           |   ✅   |        ❌        | In-memory; not routed → R1 |
-| Usage metering (model + repo)          |   ⚠️   |        ❌        | Repo SQL mismatches table → B4 |
-| Async usage tracking (queue + worker + middleware) | ✅ | ❌ | `AsyncUsageTracker` + `UsageMiddleware` built; never constructed → R12, R4 |
-| Health / readiness checks (`/health`, `/ready`) | ✅ | ❌ | `HealthChecker` + handlers built; not routed → R13 |
-| Graceful shutdown (`ShutdownManager`, `GracefulServer`) | ✅ | ❌ | Built; `main.go` still calls bare `srv.Start()`, no signal handling → R11 |
-| Edge middleware (CORS + security headers) | ✅ | ❌ | `EdgePolicy` / `NewEdgeMiddleware` built; never applied → R14 |
-| Refresh-token endpoint                 |   ❌   |        ❌        | Service exists; no handler → R5 |
+| Config loading & validation + `db.Ping`|   ✅   |        ✅        | All policies/secrets/upstreams from env |
+| Structured logging (slog + req ID)     |   ✅   |        ✅        | Global middleware |
+| Metrics registry (counters/gauges/durations) | ✅ | ✅ | `NewRegistry()` wired |
+| Per-request trace (`Trace` + context)  |   ✅   |        ✅        | Attached by obs middleware |
+| Observability middleware (timing, bytes) | ✅   |        ✅        | Global `Use`; per-tenant label still `unknown` → R10-rem |
+| `/metrics` Prometheus scrape endpoint  |   ✅   |        ✅        | Routed |
+| SQL migrations                         |   ✅   |        ✅        | Match repo SQL (no runner yet → R7) |
+| Repository layer (CRUD + tx)           |   ✅   |        ✅        | Counts verified |
+| Onboarding service (atomic)            |   ✅   |        ✅        | INSERT bug fixed; needs Postgres to run |
+| Auth service / login + refresh         |   ✅   |        ✅        | Routed at `/login`; refresh verified |
+| Custom JWT (HS256)                     |   ✅   |        ✅        | Issue/verify/refresh |
+| Password hashing (PBKDF2)              |   ✅   |        ✅        | Round-trip verified |
+| API key auth (SHA-256)                 |   ✅   |        ✅        | Data-plane machine auth |
+| Tenant resolution                      |   ✅   |        ✅        | Bearer + `X-Tenant-ID` path |
+| Trie router (+ catch-all)              |   ✅   |        ✅        | Catch-all `/{path...}` fixed |
+| Reverse proxy (per-tenant)             |   ✅   |        ✅        | From `StaticRegistry` of config upstreams |
+| Request/response transforms            |   ✅   |     ⚠️ bug        | Headers + path; `RewritePath` clobbers base path → N7 |
+| Retry transport (backoff+jitter)       |   ✅   |        ✅        | Recovers 5xx; dead code → C4, overflow → N2 |
+| Circuit breaker (CLOSED/OPEN/HALF_OPEN)|   ✅   |        ✅        | open→half-open→close verified |
+| Cache (Memory/Hybrid + response cache) |   ✅   |     ⚠️ partial    | Wired on proxied routes; identity-cache injection pending → R9-rem |
+| Rate limiting (token bucket)           |   ✅   |        ✅        | 429 + Retry-After; flooring → N3, keyfunc → N10 |
+| Usage metering (model + repo)          |   ✅   |        ✅        | SQL matches table |
+| Async usage tracking (queue + middleware) | ✅ |     ⚠️ bug        | Wired; shutdown send-on-closed race → N5 |
+| Health / readiness (`/health`, `/ready`) | ✅ |        ✅        | DB ping + upstream probes |
+| Graceful shutdown (`ShutdownManager`)  |   ✅   |        ✅        | `Wrap` + hooks + SIGINT/SIGTERM + 30s drain |
+| Edge middleware (CORS + security)      |   ✅   |     ⚠️ bug        | Global `Use`; dead nosniff knob → N9 |
+| Refresh-token endpoint                 |   ❌   |        ❌        | Service works; no handler → R5 |
 | Admin/dashboard API                    |   ❌   |        ❌        | Not started → R8 |
-| Tests                                  |   ❌   |        ❌        | None → C6 |
+| Tests                                  |   ⚠️   |        ❌        | `-race` simulation passes; not committed → C6 |
 
-Legend: ✅ done · ⚠️ partial/buggy · ❌ missing · — n/a
+Legend: ✅ done/live · ⚠️ partial or has a known bug · ❌ missing · — n/a
 
 > Full checklist with completion tracking, priorities, and a suggested order of
 > attack: **[TODO.md](TODO.md)**.
@@ -2880,41 +2845,29 @@ Legend: ✅ done · ⚠️ partial/buggy · ❌ missing · — n/a
 
 ## Roadmap & Next Steps
 
-In rough priority order to get from "library" to "running gateway":
+The "library → running gateway" work is **done**: schema/repos fixed, app
+assembled, data plane + observability + cache + graceful shutdown + async usage +
+health + edge all wired, secrets/policies/upstreams in config. What's left, in
+rough priority order:
 
-1. **Fix the migrations & repo SQL** so they agree (items 2–9 above): rename
-   columns (`password`→`password_hash`, `endpoint`/`path`, add/remove
-   `expires_at`, `timestamp`), fix the `001` trailing comma, reconcile the
-   tenant status CHECK, and make ID/timestamp handling consistent (either let the
-   DB generate IDs everywhere, or insert the app-generated ones everywhere).
-2. **Assemble the app** in a bootstrap function: open the DB, build repos +
-   services + JWT manager, construct the router, register `/onboard` and
-   `/login`, and have `server.New` serve the router.
-3. **Wire the data plane:** build a `proxy.StaticRegistry` of `UpstreamTarget`s,
-   chain `APIKeyAuth`/`TenantResolution` → `ratelimit` → `proxy.Handler` on the
-   proxied routes.
-4. **Move secrets/policies into config:** JWT secret/issuer/TTLs, rate-limit
-   rules, upstream definitions, and cache settings (`CACHE_REMOTE_URL`,
-   `CACHE_TIMEOUT`, `CACHE_NAMESPACE`, `CACHE_TOKEN`) into env vars.
-   Wire `HybridStore` into auth middlewares and start a `PruneExpired` goroutine.
-5. **Persist upstreams & usage:** add an `upstreams` table + repository, and
-   write `Usage` rows from the proxy path (capture bytes in/out).
-6. **Add a refresh endpoint** and (later) token revocation using the `jti`.
-7. **Wire the operational subsystems that already exist** (built but dormant):
-   - **Graceful shutdown (R11):** swap `server.New` for the `GracefulServer` +
-     `ShutdownManager`, add `SIGINT`/`SIGTERM` handling, and register every
-     background worker via `RegisterHook` so they drain on exit.
-   - **Async usage tracking (R12):** construct `AsyncUsageTracker`, wrap proxied
-     routes with `UsageMiddleware`, and register `tracker.Close` as a shutdown
-     hook. (This is the concrete implementation of R4.)
-   - **Health & readiness (R13):** construct `HealthChecker` and route
-     `GET /health` (liveness) + `GET /ready` (DB ping + upstream probes).
-   - **Edge middleware (R14):** move the CORS/security-header policy into config
-     and apply `NewEdgeMiddleware` as global router middleware.
-8. **Remaining operational hardening:** `db.Ping()` on startup (C5), a
-   `PruneIdle` goroutine for the limiter, and a real migration runner.
-9. **Add tests** — the components are highly testable (clock injection, repo
-   interfaces, pure helpers) and currently have none (C6).
+1. **Commit the tests (C6).** A full `-race` end-to-end simulation passes
+   (login/refresh, tenant isolation, multi-segment proxying, rate-limit, retry,
+   circuit breaker) but isn't committed. Land it, plus unit tests for the pure
+   helpers — they're highly testable (clock injection, repo interfaces).
+2. **Fix the known security/correctness bugs** (see
+   [Known Issues](#known-issues--known-limitations)): login timing side-channel
+   (**N1**), async-usage shutdown panic (**N5**), retry backoff overflow
+   (**N2**), `GetBySlug` status (**N4**), and the middleware/proxy edge cases
+   (**N6**–**N10**).
+3. **Clean up retry scaffolding (C4):** wire in or delete the unused
+   `retryableBody` / `normalizeContextErr` / `bufferBody` / `bodyFromBytes`.
+4. **Finish cache & metrics wiring:** identity-cache injection into the auth
+   middlewares (**R9-rem**) and a real per-tenant metric label (**R10-rem**).
+5. **Persist upstreams (R3)** in a DB table (currently `UPSTREAMS_JSON` env) and
+   add a **migration runner (R7)** (SQL is still applied by hand).
+6. **Add a refresh endpoint (R5)** (the service method exists) and, later,
+   token revocation via `jti` (**R6**).
+7. **Admin / dashboard API (R8).**
 
 ---
 

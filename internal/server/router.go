@@ -442,6 +442,15 @@ type routeSegment struct {
 	// matches ANY single path component and captures it under paramName.
 	isParam bool
 
+	// isCatchAll marks a trailing wildcard segment of the form "{name...}".
+	// Unlike a plain parameter (which matches exactly one path component), a
+	// catch-all matches the ENTIRE remainder of the path — zero or more
+	// components — and captures it (joined by "/") under paramName. It is only
+	// valid as the LAST segment of a pattern.
+	//
+	// Example: "/{path...}" matches "/", "/orders", "/orders/123", "/v1/u/5".
+	isCatchAll bool
+
 	// literal is the static text for literal segments.
 	//
 	// Example: for segment "users" in "/users/{id}", literal = "users".
@@ -574,6 +583,16 @@ type node struct {
 	// the request "/users/settings" matches the STATIC route. This is the
 	// expected behavior — exact matches always win over wildcards.
 	paramChild *node
+
+	// catchAllChild holds the single trailing-wildcard child for a "{name...}"
+	// segment. It is tried LAST — only after both staticChildren and paramChild
+	// fail to produce a match — so more specific routes always win. When it
+	// matches, it consumes ALL remaining path segments at once.
+	//
+	// catchAllParam is the parameter name under which the captured remainder
+	// (joined by "/") is exposed to the handler.
+	catchAllChild *node
+	catchAllParam string
 
 	// routes maps HTTP method → compiled route at THIS node.
 	//
@@ -1172,6 +1191,10 @@ func buildRouteKey(segments []routeSegment) string {
 	parts := make([]string, len(segments))
 
 	for i, seg := range segments {
+		if seg.isCatchAll {
+			parts[i] = "{...}"
+			continue
+		}
 		if seg.isParam {
 			parts[i] = "{}"
 			continue
@@ -1262,32 +1285,35 @@ func (n *node) match(segments []string, idx int, values []string) (*node, []stri
 		return nil, nil, false
 	}
 
-	// Base case: we've consumed every segment.
-	//
-	// If THIS node has any routes registered, we matched. If not, we
-	// stopped at an "intermediate" node (a prefix) and this isn't a hit.
-	if idx == len(segments) {
-		if len(n.routes) > 0 {
-			return n, values, true
-		}
-		return nil, nil, false
+	// We've consumed every segment: it's a hit if THIS node has routes.
+	if idx == len(segments) && len(n.routes) > 0 {
+		return n, values, true
 	}
 
-	segment := segments[idx]
+	// Try a more specific child first: static, then single-segment param.
+	// Both only apply while segments remain.
+	if idx < len(segments) {
+		segment := segments[idx]
 
-	// Try static match first — most specific wins.
-	if child, ok := n.staticChildren[segment]; ok {
-		if matchedNode, matchedValues, ok := child.match(segments, idx+1, values); ok {
-			return matchedNode, matchedValues, true
+		if child, ok := n.staticChildren[segment]; ok {
+			if matchedNode, matchedValues, ok := child.match(segments, idx+1, values); ok {
+				return matchedNode, matchedValues, true
+			}
+		}
+
+		if n.paramChild != nil {
+			if matchedNode, matchedValues, ok := n.paramChild.match(segments, idx+1, append(values, segment)); ok {
+				return matchedNode, matchedValues, true
+			}
 		}
 	}
 
-	// Fall back to parameter match.
-	if n.paramChild != nil {
-		nextValues := append(values, segment)
-		if matchedNode, matchedValues, ok := n.paramChild.match(segments, idx+1, nextValues); ok {
-			return matchedNode, matchedValues, true
-		}
+	// Finally, fall back to a catch-all. It consumes ALL remaining segments
+	// (joined by "/") as one captured value — and matches zero of them too, so
+	// segments[idx:] is "" when the path is already exhausted. Tried last so
+	// static and single-param routes always take precedence.
+	if n.catchAllChild != nil && len(n.catchAllChild.routes) > 0 {
+		return n.catchAllChild, append(values, strings.Join(segments[idx:], "/")), true
 	}
 
 	return nil, nil, false
@@ -1403,6 +1429,20 @@ func insertRoute(
 	current := root
 
 	for _, seg := range segments {
+		if seg.isCatchAll {
+			if current.catchAllChild == nil {
+				current.catchAllChild = &node{
+					staticChildren: make(map[string]*node),
+					routes:         make(map[string]*builtRoute),
+				}
+			}
+
+			current.catchAllParam = seg.paramName
+			current = current.catchAllChild
+
+			continue
+		}
+
 		if seg.isParam {
 			if current.paramChild == nil {
 				current.paramChild = &node{
@@ -1478,6 +1518,10 @@ func buildAllowedMethods(n *node) {
 
 	if n.paramChild != nil {
 		buildAllowedMethods(n.paramChild)
+	}
+
+	if n.catchAllChild != nil {
+		buildAllowedMethods(n.catchAllChild)
 	}
 }
 
@@ -1619,7 +1663,7 @@ func parsePattern(pattern string) ([]routeSegment, error) {
 	rawSegments := strings.Split(strings.Trim(pattern, "/"), "/")
 	segments := make([]routeSegment, 0, len(rawSegments))
 
-	for _, seg := range rawSegments {
+	for i, seg := range rawSegments {
 		if seg == "" {
 			return nil, fmt.Errorf("invalid pattern %q: empty segment", pattern)
 		}
@@ -1632,6 +1676,27 @@ func parsePattern(pattern string) ([]routeSegment, error) {
 			}
 
 			name := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(seg, "{"), "}"))
+
+			// A "{name...}" segment is a catch-all: it matches the entire
+			// remainder of the path, so it is only valid as the LAST segment.
+			if strings.HasSuffix(name, "...") {
+				if i != len(rawSegments)-1 {
+					return nil, fmt.Errorf("invalid pattern %q: catch-all parameter %q must be the final segment", pattern, seg)
+				}
+
+				name = strings.TrimSpace(strings.TrimSuffix(name, "..."))
+				if name == "" {
+					return nil, fmt.Errorf("invalid pattern %q: empty catch-all parameter name", pattern)
+				}
+
+				segments = append(segments, routeSegment{
+					isParam:    true,
+					isCatchAll: true,
+					paramName:  name,
+				})
+				continue
+			}
+
 			if name == "" {
 				return nil, fmt.Errorf("invalid pattern %q: empty path parameter name", pattern)
 			}

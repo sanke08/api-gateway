@@ -30,34 +30,43 @@ We use a three-tier error system to ensure implementation details never leak to 
 - `ServiceError`: Categorizes business failures (validation, internal).
 - `Handler`: Maps Service errors to standard HTTP status codes (400, 409, 500).
 
-> ⚠️ **This is the original, aspirational README, kept for history.** It
-> overstates the current status: the items below are **written and individually
-> coherent, but the application is not assembled and several schema/SQL
-> mismatches stop it from running end to end.** For the accurate, verified
-> status see **[README.md](README.md)** and the prioritized checklist in
-> **[TODO.md](TODO.md)**. (Last reconciled: 2026-06-28 — still builds &
-> `go vet`-clean, 0 tests, none of the blocking bugs B1–B9 fixed.)
+> 📜 **This is the original, aspirational README, kept for history.** When it
+> was written, the components below existed but the application was **not
+> assembled** and several schema/SQL mismatches stopped it from running. **That
+> is no longer true.** As of **2026-06-30** the app is fully wired, the blocking
+> bugs are fixed, and the full request path has been exercised end-to-end. For
+> the accurate, current status see **[README.md](README.md)** and the checklist
+> in **[TODO.md](TODO.md)**. The sections below are preserved as a snapshot of
+> the project's original intent.
 
-## 🧩 Built Components (code exists & compiles — not yet wired/running)
-- [x] **Atomic Onboarding** logic: `OnboardTenant` creates Tenant + Admin User + Owner Membership + API Key in one transaction. *(Handler not routed; blocked by repo/SQL bugs.)*
+## 🧩 Built Components — now wired and running
+What this README originally listed as "built but not assembled" is now wired
+into `main.go` and exercised end-to-end:
+- [x] **Atomic Onboarding**: `OnboardTenant` creates Tenant + Admin User + Owner Membership + API Key in one transaction. *(An API-key INSERT param-count bug that broke this was fixed on 2026-06-30.)*
 - [x] **Custom Security**: hand-rolled PBKDF2 password hashing, SHA-256 API-key hashing, HS256 JWT — `crypto/*` only.
 - [x] **Transaction Support**: `WithTx` rebinding shared across all repositories.
 - [x] **Multi-Tenant Schema**: users belong to many tenants via `TenantMembership`.
-- [x] **Authentication & JWT** + login flow logic. *(Not routed.)*
-- [x] **Tenant Resolution** + **API-Key Auth** middleware. *(Not routed.)*
-- [x] **Reverse Proxy, Rate Limiting, Retry, Circuit Breaker, Cache layer.** *(Built; no registry/wiring.)*
-- [x] **Observability**: metrics registry + per-request trace + middleware. *(Only the slog logger is actually live.)*
-- [x] **Graceful shutdown, async usage tracking, health/readiness checks, edge (CORS + security headers).** *(All built; never instantiated.)*
+- [x] **Authentication & JWT** + login + refresh — routed at `/login`.
+- [x] **Tenant Resolution** + **API-Key Auth** middleware — guarding the data plane.
+- [x] **Reverse Proxy, Rate Limiting, Retry, Circuit Breaker, Cache layer** — wired on proxied routes.
+- [x] **Observability**: metrics registry + per-request trace + middleware + `/metrics`.
+- [x] **Graceful shutdown, async usage tracking, health/readiness checks, edge (CORS + security headers).**
 
 ## 🟢 Actually live today
-- [x] **Structured Logging**: JSON logging via `slog` with Request ID tracing — the **one** wired middleware. The server otherwise serves an empty mux (404 for every path).
+The server assembles the full pipeline and serves real routes:
+`/onboard`, `/login`, `/metrics`, `/health`, `/ready`, and (when upstreams are
+configured) the proxied data-plane routes. Structured JSON logging via `slog`
+with Request-ID tracing runs on every request, alongside the metrics and edge
+middleware. (The old "empty mux, 404 for every path" state is gone.)
 
 ## 🛠️ Remaining Tasks (Roadmap)
-- [ ] **Fix schema/SQL mismatches** so queries run (trailing comma, `password`/`password_hash`, usage `path`/`timestamp` vs `endpoint`/`created_at`, `api_keys.expires_at`, Scan column counts, ID/timestamp handling).
-- [ ] **Assemble the app**: open DB, build repos/services, construct the router, register `/onboard` + `/login`, serve the router instead of a bare mux.
-- [ ] **Wire the data plane**: populate a proxy registry; chain auth → rate-limit → proxy.
-- [ ] **Wire the operational subsystems**: graceful shutdown + signal handling, async usage tracking, `/health`+`/ready`, edge/CORS.
-- [ ] **Admin Dashboard API**, **refresh-token endpoint**, **token revocation**, **tests**.
+The blocking work is complete. What remains is cleanup and feature build-out
+(full detail in [TODO.md](TODO.md)):
+- [ ] **Commit the test suite** — a full `-race` end-to-end simulation passes but isn't yet committed.
+- [ ] **Address known bugs** found by review/simulation — login timing side-channel, async-usage shutdown race, retry backoff overflow, `GetBySlug` status, a few middleware/proxy edge cases.
+- [ ] **Persist upstreams** in a DB table (currently from `UPSTREAMS_JSON`).
+- [ ] **Refresh-token endpoint** (service method exists, no route), **token revocation**, **admin dashboard API**.
+- [ ] **Finish cache/metrics wiring** — identity-cache injection into auth middleware; per-tenant metric label.
 
 ## 🛠️ Technology Stack
 - **Language**: Go 1.25.4 (standard library only for logic; `lib/pq` is the one third-party dep)
